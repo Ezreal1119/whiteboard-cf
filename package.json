@@ -1,0 +1,14 @@
+{
+  "name": "ten-minute-whiteboard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "check": "node --check src/worker.js && node --check public/app.js",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.92.0"
+  }
+}

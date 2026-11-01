@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f3efe7" />
+    <meta name="description" content="A private, temporary text board that clears itself after ten minutes." />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+    <title>Ten Minute Board</title>
+  </head>
+  <body>
+    <main class="page-shell">
+      <header class="masthead">
+        <a class="wordmark" href="#board" aria-label="Ten Minute Board">
+          <span class="wordmark-dot" aria-hidden="true"></span>
+          <span>Ten Minute Board</span>
+        </a>
+        <div class="live-state" aria-live="polite">
+          <span class="live-dot"></span>
+          <span id="syncLabel">Connecting</span>
+        </div>
+      </header>
+
+      <section class="intro" aria-labelledby="pageTitle">
+        <p class="eyebrow">TEMPORARY CLIPBOARD</p>
+        <h1 id="pageTitle">Type it here.<br />Pick it up anywhere.</h1>
+        <p class="intro-copy">This board syncs across your devices and clears itself ten minutes after the last edit.</p>
+      </section>
+
+      <section class="board-card" id="board" aria-label="Temporary clipboard">
+        <div class="board-toolbar">
+          <div class="timer-group">
+            <span class="timer-ring" id="timerRing" aria-hidden="true"></span>
+            <div>
+              <span class="timer-label">TIME REMAINING</span>
+              <strong id="timerValue">10:00</strong>
+            </div>
+          </div>
+          <div class="toolbar-actions">
+            <button class="button button-quiet" id="clearButton" type="button">Clear</button>
+            <button class="button button-copy" id="copyButton" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>
+              <span>Copy</span>
+            </button>
+          </div>
+        </div>
+
+        <label class="sr-only" for="boardInput">Temporary text</label>
+        <textarea id="boardInput" maxlength="100000" spellcheck="false" placeholder="Paste a link, a note, a command, anything…" autofocus></textarea>
+
+        <footer class="board-footer">
+          <span id="saveState">Ready</span>
+          <span><span id="characterCount">0</span> characters</span>
+        </footer>
+      </section>
+
+      <p class="privacy-note"><span aria-hidden="true">×</span> Nothing here is permanent. The board is deleted automatically after ten quiet minutes.</p>
+    </main>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
