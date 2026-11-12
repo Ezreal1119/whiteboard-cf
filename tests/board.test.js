@@ -153,8 +153,10 @@ test("upload, cross-device list, preview and download preserve original bytes", 
 test("filename URLs support curl remote naming and resume while legacy links stay valid", async () => {
   await reset();
   const body = "firmware bytes for curl resume";
-  const file = await (await upload("firmware.apk", body, "application/octet-stream")).json();
-  assert.equal(file.downloadUrl, `/api/files/${file.id}/firmware.apk`);
+  const file = await (await upload("firmware (2).apk", body, "application/octet-stream")).json();
+  const downloadName = "firmware_2_.apk";
+  assert.equal(file.name, "firmware (2).apk");
+  assert.equal(file.downloadUrl, `/api/files/${file.id}/${downloadName}`);
   const head = await request(file.downloadUrl, { method: "HEAD" });
   assert.equal(head.status, 200);
   assert.equal(head.headers.get("Accept-Ranges"), "bytes");
@@ -166,15 +168,15 @@ test("filename URLs support curl remote naming and resume while legacy links sta
   try {
     const url = new URL(file.downloadUrl, await mf.ready).href;
     await promisify(execFile)("curl", ["--fail", "--silent", "--show-error", "--noproxy", "*", "-C", "-", "-O", url], { cwd: dir, timeout: 15000 });
-    assert.equal(await readFile(join(dir, file.name), "utf8"), body);
-    await writeFile(join(dir, file.name), body.slice(0, 5));
+    assert.equal(await readFile(join(dir, downloadName), "utf8"), body);
+    await writeFile(join(dir, downloadName), body.slice(0, 5));
     await promisify(execFile)("curl", ["--fail", "--silent", "--show-error", "--noproxy", "*", "-C", "-", "-O", url], { cwd: dir, timeout: 15000 });
-    assert.equal(await readFile(join(dir, file.name), "utf8"), body);
+    assert.equal(await readFile(join(dir, downloadName), "utf8"), body);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
   const image = await (await upload("测试 #1?.png")).json();
-  assert.equal(image.downloadUrl, `/api/files/${image.id}/${encodeURIComponent(image.name)}`);
+  assert.equal(image.downloadUrl, `/api/files/${image.id}/_1_.png`);
   const download = await request(image.downloadUrl);
   assert.equal(download.status, 200);
   assert.match(download.headers.get("Content-Disposition"), /^attachment;/);

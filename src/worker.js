@@ -454,12 +454,13 @@ export class ClipboardBoard extends DurableObject {
 }
 
 function downloadName(name) {
-  // Dot-only names cannot be represented as URL path segments.
-  return name === "." || name === ".." ? "download" : name;
+  // A URL-safe ASCII name also works literally with curl -O, without decoding.
+  const filename = name.replace(/[^A-Za-z0-9._-]+/g, "_");
+  return filename === "." || filename === ".." || !filename ? "download" : filename;
 }
 
 function publicFile({ id, name, size, type, uploadedAt, expiresAt }) {
-  const filename = encodeURIComponent(downloadName(name)).replace(/['()*]/g, ch => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
+  const filename = downloadName(name);
   return { id, name, size, type, uploadedAt, expiresAt, previewable: INLINE_TYPES.has(type), downloadUrl: `/api/files/${id}/${filename}` };
 }
 

@@ -4,6 +4,7 @@ import json
 import configparser
 import getpass
 import os
+import re
 import shutil
 import tempfile
 import mimetypes
@@ -73,8 +74,10 @@ def format_size(size):
 
 
 def download_url(file):
-    name = file["name"] if file["name"] not in (".", "..") else "download"
-    return f"{BASE_URL}/api/files/{quote(file['id'], safe='')}/{quote(name, safe='')}"
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", file["name"])
+    if name in ("", ".", ".."):
+        name = "download"
+    return f"{BASE_URL}/api/files/{quote(file['id'], safe='')}/{name}"
 
 
 def show_board():

@@ -65,7 +65,7 @@ Download links include the filename, with no query string. Quote the URL when us
 curl -C - -O "https://whiteboard.patrick-shenzhen.org/api/files/<id>/firmware.apk"
 ```
 
-The API returns a relative `downloadUrl` for each file. Existing ID-only links remain valid. Curl's `-O` preserves percent-encoded characters literally, so filenames containing spaces or non-ASCII characters can appear encoded on disk; use `-o "original filename"` for an exact local name in those cases.
+The API returns a relative `downloadUrl` for each file. Existing ID-only links remain valid. For literal `curl -O` naming, the URL filename retains ASCII letters, digits, dots, hyphens, and underscores; other character runs become underscores. For example, `firmware (2).apk` downloads as `firmware_2_.apk`. The original filename remains in the file metadata and browser download header. Use `-o "original filename"` if you need that exact local name.
 
 The terminal reserves capacity through the API, runs rclone directly against the reserved object key, then registers the completed file after the server verifies its size and timestamp. Transfers always use R2 multipart uploads (16 MiB chunks, four concurrent parts) so in-flight transfers can be explicitly aborted. Rclone is capped at 22 hours, below the reservation's 24-hour lease. The `patrick wb list` command prints all text, active attachment download links, and storage usage.
 
@@ -88,7 +88,7 @@ All routes are relative to `https://whiteboard.patrick-shenzhen.org`. No API key
 | POST | `/api/uploads/{id}/cancel` | JSON `{ "stopToken": "..." }`; acknowledges that rclone has stopped and requests cleanup |
 | DELETE | `/api/uploads/{id}` | Cancels a pending session and releases quota after storage cleanup |
 | POST | `/api/files` | Legacy raw upload, up to 32 MiB; requires Content-Length, URL-encoded X-File-Name, and Content-Type |
-| GET / HEAD | `/api/files/{id}/{filename}` | Download using the original filename in the URL; supports Range and `curl -C - -O` |
+| GET / HEAD | `/api/files/{id}/{filename}` | Download using a curl-safe filename in the URL; supports Range and `curl -C - -O` |
 | GET / HEAD | `/api/files/{id}` | Legacy preview or download; append `?download` to force download |
 | DELETE | `/api/files/{id}` | Deletes the attachment |
 
