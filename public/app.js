@@ -235,7 +235,8 @@ function renderFiles(nextFiles = [], storage = null) {
     card.className = "file-card";
     const link = document.createElement("a");
     link.className = "file-preview";
-    link.href = `/api/files/${file.id}${file.previewable ? "" : "?download"}`;
+    const downloadUrl = file.downloadUrl || `/api/files/${file.id}/${encodeURIComponent(file.name)}`;
+    link.href = file.previewable ? `/api/files/${file.id}` : downloadUrl;
     link.target = "_blank";
     link.rel = "noopener";
     if (file.previewable) {
@@ -264,7 +265,7 @@ function renderFiles(nextFiles = [], storage = null) {
     const actions = document.createElement("div");
     actions.className = "file-actions";
     const download = document.createElement("a");
-    download.href = `/api/files/${file.id}?download`;
+    download.href = downloadUrl;
     download.textContent = "Download";
     const remove = document.createElement("button");
     remove.type = "button";

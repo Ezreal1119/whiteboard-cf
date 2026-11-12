@@ -37,17 +37,17 @@ class CLITests(unittest.TestCase):
         text = 'Text "quoted"\nUnicode: 中文'
         with patch.object(cli.subprocess, "run", return_value=reply({})) as run:
             with contextlib.redirect_stdout(io.StringIO()):
-                cli.main([text])
+                cli.main(["-t", text])
             self.assertEqual(json.loads(run.call_args.kwargs["input"]), {"text": text})
 
-    def test_get_lists_images_and_gigabyte_files_in_english(self):
+    def test_list_shows_images_and_gigabyte_files_in_english(self):
         data = {"text": "all\ntext", "files": [{"id": "file-id", "name": "image.png", "size": 2_000_000_000}]}
         output = io.StringIO()
         with patch.object(cli.subprocess, "run", return_value=reply(data)), contextlib.redirect_stdout(output):
-            cli.main(["--get"])
+            cli.main(["list"])
         self.assertIn("all\ntext", output.getvalue())
         self.assertIn("image.png (2.00 GB)", output.getvalue())
-        self.assertIn("/api/files/file-id?download", output.getvalue())
+        self.assertIn("/api/files/file-id/image.png", output.getvalue())
 
     def test_rejected_metadata_is_not_retried(self):
         with patch.object(cli.subprocess, "run", return_value=reply({"error": "Quota exceeded"}, 413)) as run:

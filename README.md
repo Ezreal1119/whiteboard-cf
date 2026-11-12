@@ -53,13 +53,21 @@ wb)
 Keep `patrick list` up to date when changing commands or options. Supported uses:
 
 ```bash
-patrick wb "Text to share"
+patrick wb -t "Text to share"
 patrick wb -f ~/Downloads/firmware.apk
-patrick wb --get
+patrick wb list
 patrick wb --setup
 ```
 
-The terminal reserves capacity through the API, runs rclone directly against the reserved object key, then registers the completed file after the server verifies its size and timestamp. Transfers always use R2 multipart uploads (16 MiB chunks, four concurrent parts) so in-flight transfers can be explicitly aborted. Rclone is capped at 22 hours, below the reservation's 24-hour lease. The `--get` command prints all text, active attachment download links, and storage usage.
+Download links include the filename, with no query string. Quote the URL when using curl:
+
+```sh
+curl -C - -O "https://whiteboard.patrick-shenzhen.org/api/files/<id>/firmware.apk"
+```
+
+The API returns a relative `downloadUrl` for each file. Existing ID-only links remain valid. Curl's `-O` preserves percent-encoded characters literally, so filenames containing spaces or non-ASCII characters can appear encoded on disk; use `-o "original filename"` for an exact local name in those cases.
+
+The terminal reserves capacity through the API, runs rclone directly against the reserved object key, then registers the completed file after the server verifies its size and timestamp. Transfers always use R2 multipart uploads (16 MiB chunks, four concurrent parts) so in-flight transfers can be explicitly aborted. Rclone is capped at 22 hours, below the reservation's 24-hour lease. The `patrick wb list` command prints all text, active attachment download links, and storage usage.
 
 On errors or Ctrl-C, the helper stops the entire rclone process group before acknowledging cancellation. A private per-upload stop token prevents another client from claiming the uploader has stopped. Board-side cancellation hides the session and triggers cleanup, while retaining its reserved capacity until the uploader acknowledges stopping or the lease expires. The helper checks session status during transfers and stops if the board cancels the upload. The Worker lists and aborts only multipart uploads for that exact object key, deletes the object, and releases capacity after cleanup succeeds. Failed cleanup retries every minute. A killed uploader without acknowledgement remains reserved until lease expiry.
 
@@ -80,7 +88,8 @@ All routes are relative to `https://whiteboard.patrick-shenzhen.org`. No API key
 | POST | `/api/uploads/{id}/cancel` | JSON `{ "stopToken": "..." }`; acknowledges that rclone has stopped and requests cleanup |
 | DELETE | `/api/uploads/{id}` | Cancels a pending session and releases quota after storage cleanup |
 | POST | `/api/files` | Legacy raw upload, up to 32 MiB; requires Content-Length, URL-encoded X-File-Name, and Content-Type |
-| GET / HEAD | `/api/files/{id}` | Preview or download; append `?download` to force download |
+| GET / HEAD | `/api/files/{id}/{filename}` | Download using the original filename in the URL; supports Range and `curl -C - -O` |
+| GET / HEAD | `/api/files/{id}` | Legacy preview or download; append `?download` to force download |
 | DELETE | `/api/files/{id}` | Deletes the attachment |
 
 For direct terminal uploads, create a session with `mode: "rclone"` and a cryptographically random 64-character hexadecimal `stopToken`. Keep this token private. The session returns the reserved `bucket` and `key`; it does not create a native multipart upload or relay bytes. After rclone exits, include the token in completion or cancellation JSON. Status responses never expose the token or its stored hash.

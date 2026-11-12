@@ -11,6 +11,7 @@ const UPLOAD_TTL = DAY;
 const MAX_FILES = 20;
 const MAX_TOTAL_SIZE = 20_000_000_000;
 const UUID = "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}";
+const FILE_PATH = new RegExp(`^/api/files/(${UUID})(?:/([^/]+))?$`);
 const UPLOAD_PATH = new RegExp(`^/api/uploads/(${UUID})(?:/(complete|cancel|parts/[1-9][0-9]*))?$`);
 const RETRY_DELAY = 60_000;
 const INLINE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif"]);
@@ -20,7 +21,7 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/api/uploads/config" && request.method === "GET") return json({ rclone: rcloneConfig(env) });
     const isAPI = url.pathname === "/api/board" || url.pathname === "/api/files"
-      || new RegExp(`^/api/files/${UUID}$`).test(url.pathname)
+      || FILE_PATH.test(url.pathname)
       || url.pathname === "/api/uploads" || UPLOAD_PATH.test(url.pathname);
     if (isAPI) {
       if (!["GET", "HEAD"].includes(request.method)) {
@@ -105,9 +106,11 @@ export class ClipboardBoard extends DurableObject {
         if (action?.startsWith("parts/") && request.method === "PUT") return this.uploadPart(uploadId, Number(action.slice(6)), request);
         return json({ error: "Method not allowed." }, 405);
       }
-      const id = url.pathname.split("/").pop();
-      if (["GET", "HEAD"].includes(request.method)) return this.download(id, request, url.searchParams.has("download"));
-      if (request.method === "DELETE") return this.remove(id);
+      const fileMatch = url.pathname.match(FILE_PATH);
+      if (!fileMatch) return json({ error: "Not found." }, 404);
+      const [, id, filename] = fileMatch;
+      if (["GET", "HEAD"].includes(request.method)) return this.download(id, request, Boolean(filename) || url.searchParams.has("download"), filename);
+      if (request.method === "DELETE" && !filename) return this.remove(id);
       return json({ error: "Method not allowed." }, 405, { Allow: "GET, HEAD, DELETE" });
     }).catch(error => {
       if (!(error instanceof BodySizeError)) console.error("Board request failed", error);
@@ -347,9 +350,15 @@ export class ClipboardBoard extends DurableObject {
     return json({ cancelled: true, cleanupPending: !deleted });
   }
 
-  async download(id, request, forceDownload) {
+  async download(id, request, forceDownload, filename) {
     const file = await this.ctx.storage.get(`file:${id}`);
     if (!file || file.status !== "ready" || file.expiresAt <= Date.now()) return json({ error: "File not found or expired." }, 404);
+    if (filename !== undefined) {
+      let decoded;
+      try { decoded = decodeURIComponent(filename); }
+      catch { return json({ error: "Invalid file name." }, 400); }
+      if (decoded !== downloadName(file.name)) return json({ error: "File not found." }, 404);
+    }
     const range = request.method === "GET" ? parseRange(request.headers.get("Range"), file.size) : null;
     if (range === false) return new Response(null, { status: 416, headers: { "Content-Range": `bytes */${file.size}`, "Cache-Control": "no-store" } });
     const object = request.method === "HEAD" ? await this.env.ATTACHMENTS.head(file.key) : await this.env.ATTACHMENTS.get(file.key, range ? { range } : undefined);
@@ -444,8 +453,14 @@ export class ClipboardBoard extends DurableObject {
   }
 }
 
+function downloadName(name) {
+  // Dot-only names cannot be represented as URL path segments.
+  return name === "." || name === ".." ? "download" : name;
+}
+
 function publicFile({ id, name, size, type, uploadedAt, expiresAt }) {
-  return { id, name, size, type, uploadedAt, expiresAt, previewable: INLINE_TYPES.has(type) };
+  const filename = encodeURIComponent(downloadName(name)).replace(/['()*]/g, ch => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
+  return { id, name, size, type, uploadedAt, expiresAt, previewable: INLINE_TYPES.has(type), downloadUrl: `/api/files/${id}/${filename}` };
 }
 
 function emptyBoard() {

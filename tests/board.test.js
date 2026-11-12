@@ -5,6 +5,11 @@ import { fileURLToPath } from "node:url";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
 import { uploadFile as uploadClient } from "../public/uploads.js";
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 let mf, stub, bucket;
 let s3Failure = false;
@@ -144,6 +149,38 @@ test("upload, cross-device list, preview and download preserve original bytes", 
   assert.match(download.headers.get("Content-Disposition"), /filename\*=UTF-8/);
   assert.equal(await download.text(), "image bytes");
   assert.equal((await request(`/api/files/${file.id}`, { method: "HEAD" })).status, 200);
+});
+test("filename URLs support curl remote naming and resume while legacy links stay valid", async () => {
+  await reset();
+  const body = "firmware bytes for curl resume";
+  const file = await (await upload("firmware.apk", body, "application/octet-stream")).json();
+  assert.equal(file.downloadUrl, `/api/files/${file.id}/firmware.apk`);
+  const head = await request(file.downloadUrl, { method: "HEAD" });
+  assert.equal(head.status, 200);
+  assert.equal(head.headers.get("Accept-Ranges"), "bytes");
+  assert.equal(head.headers.get("Content-Length"), String(body.length));
+  assert.equal((await request(`/api/files/${file.id}/wrong.apk`)).status, 404);
+  assert.equal((await request(`/api/files/${file.id}/%ZZ`)).status, 400);
+  assert.equal(await (await request(`/api/files/${file.id}?download`)).text(), body);
+  const dir = await mkdtemp(join(tmpdir(), "wb-curl-"));
+  try {
+    const url = new URL(file.downloadUrl, await mf.ready).href;
+    await promisify(execFile)("curl", ["--fail", "--silent", "--show-error", "--noproxy", "*", "-C", "-", "-O", url], { cwd: dir, timeout: 15000 });
+    assert.equal(await readFile(join(dir, file.name), "utf8"), body);
+    await writeFile(join(dir, file.name), body.slice(0, 5));
+    await promisify(execFile)("curl", ["--fail", "--silent", "--show-error", "--noproxy", "*", "-C", "-", "-O", url], { cwd: dir, timeout: 15000 });
+    assert.equal(await readFile(join(dir, file.name), "utf8"), body);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+  const image = await (await upload("测试 #1?.png")).json();
+  assert.equal(image.downloadUrl, `/api/files/${image.id}/${encodeURIComponent(image.name)}`);
+  const download = await request(image.downloadUrl);
+  assert.equal(download.status, 200);
+  assert.match(download.headers.get("Content-Disposition"), /^attachment;/);
+  assert.equal(await download.text(), "image bytes");
+  await stub.testExpire("files");
+  assert.equal((await request(image.downloadUrl)).status, 404);
 });
 test("active formats are downloads, never same-origin HTML or SVG previews", async () => {
   await reset();

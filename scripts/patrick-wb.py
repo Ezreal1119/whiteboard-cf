@@ -72,6 +72,11 @@ def format_size(size):
     return f"{size} B"
 
 
+def download_url(file):
+    name = file["name"] if file["name"] not in (".", "..") else "download"
+    return f"{BASE_URL}/api/files/{quote(file['id'], safe='')}/{quote(name, safe='')}"
+
+
 def show_board():
     board = request("GET", "/api/board", timeout=30)
     if not isinstance(board.get("text"), str) or not isinstance(board.get("files"), list):
@@ -83,7 +88,7 @@ def show_board():
         print("(none)")
     for index, item in enumerate(board["files"], 1):
         print(f"{index}. {item['name']} ({format_size(item['size'])})")
-        print(f"   {BASE_URL}/api/files/{quote(item['id'], safe='')}?download")
+        print(f"   {download_url(item)}")
     if "storage" in board and "limits" in board:
         print(f"\nStorage: {format_size(board['storage']['usedBytes'])} / {format_size(board['limits']['totalBytes'])} (including uploads)")
 
@@ -246,18 +251,18 @@ def setup_rclone():
 def main(args):
     if args == ["--setup"]:
         setup_rclone()
-    elif args == ["--get"]:
+    elif args == ["list"]:
         show_board()
     elif len(args) == 2 and args[0] == "-f":
         file = upload_file(args[1])
         print(f"{file['name']} uploaded. Expires in 3 days.")
-        print(f"{BASE_URL}/api/files/{quote(file['id'], safe='')}?download")
-    elif len(args) == 1 and args[0] != "-f":
-        request("PUT", "/api/board", metadata={"text": args[0]}, timeout=30)
+        print(download_url(file))
+    elif len(args) == 2 and args[0] == "-t":
+        request("PUT", "/api/board", metadata={"text": args[1]}, timeout=30)
         print("Text uploaded. Expires in 24 hours.")
         print(BASE_URL + "/")
     else:
-        raise APIError('Usage: patrick wb "text..." | patrick wb -f <path> | patrick wb --get | patrick wb --setup')
+        raise APIError('Usage: patrick wb -t "<text>" | patrick wb -f <file_or_image_path> | patrick wb list | patrick wb --setup')
 
 
 if __name__ == "__main__":
