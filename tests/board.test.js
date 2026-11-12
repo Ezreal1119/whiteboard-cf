@@ -2,6 +2,8 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
+import { uploadFile as uploadClient } from "../public/uploads.js";
+import { createHash } from "node:crypto";
 
 let mf, stub, bucket;
 before(async () => {
@@ -38,6 +40,16 @@ export class TestBoard extends ClipboardBoard {
     await this.env.ATTACHMENTS.put(file.key, 'abc');
     this.retentionMigrated = false;
     return file;
+  }
+  async testAbortUnderlying(id) {
+    const file = await this.ctx.storage.get('file:' + id);
+    await this.env.ATTACHMENTS.resumeMultipartUpload(file.key, file.uploadId).abort();
+  }
+  async testLoseCompletion(id) {
+    const file = await this.ctx.storage.get('file:' + id);
+    file.status = 'completing';
+    await this.ctx.storage.put('file:' + id, file);
+    await this.env.ATTACHMENTS.resumeMultipartUpload(file.key, file.uploadId).complete(Object.values(file.parts).map(({partNumber, etag}) => ({partNumber, etag})));
   }
   async testQuota(size) {
     const files = await this.files();
@@ -89,7 +101,7 @@ test("validation and origin checks reject invalid requests", async () => {
   assert.equal((await request("/api/board", { method: "POST" })).status, 405);
   assert.equal((await upload("empty", "")).status, 400);
   assert.equal((await upload("a".repeat(256))).status, 400);
-  assert.equal((await upload("large", new Uint8Array(20 * 1024 * 1024 + 1))).status, 413);
+  assert.equal((await request(`/api/uploads/${crypto.randomUUID()}/parts/1`, {method:"PUT", headers:{"X-Part-Size":String(32*1024*1024+1)}, body:"x"})).status, 413);
 });
 test("upload, cross-device list, preview and download preserve original bytes", async () => {
   await reset();
@@ -175,17 +187,17 @@ test("server enforces both file count and total size quotas", async () => {
   assert.equal(responses.filter(response => response.status === 413).length, 1);
   await reset();
   await upload();
-  await stub.testQuota(100 * 1024 * 1024);
+  await stub.testQuota(20_000_000_000);
   assert.equal((await upload()).status, 413);
   await reset();
 });
 
-test("a file exactly at the 20 MB boundary is accepted intact", async () => {
+test("a legacy single-request file at the 32 MiB boundary is accepted intact", async () => {
   await reset();
-  const response = await upload("boundary.bin", new Uint8Array(20 * 1024 * 1024), "application/octet-stream");
+  const response = await upload("boundary.bin", new Uint8Array(32 * 1024 * 1024), "application/octet-stream");
   assert.equal(response.status, 201);
   const file = await response.json();
-  assert.equal(file.size, 20 * 1024 * 1024);
+  assert.equal(file.size, 32 * 1024 * 1024);
   const stored = await bucket.head(`attachments/${file.id}`);
   assert.equal(stored.size, file.size);
   await reset();
@@ -202,5 +214,148 @@ test("live one-day attachments migrate to three days without restoring expired f
   assert.equal((await request(`/api/files/${expired.id}`)).status, 404);
   await stub.testCleanup();
   assert.equal((await request(`/api/files/${live.id}`)).status, 200);
+  await reset();
+});
+
+const PART = 32 * 1024 * 1024;
+async function createUpload(size, name = "large.bin", id) {
+  return request("/api/uploads", { method: "POST", body: JSON.stringify({ size, name, id, type: "application/octet-stream" }) });
+}
+async function part(id, number, body, size = body.byteLength ?? body.size ?? body.length) {
+  return request(`/api/uploads/${id}/parts/${number}`, { method: "PUT", headers: { "X-Part-Size": String(size) }, body });
+}
+const boardState = async () => (await request("/api/board")).json();
+
+test("3 GB upload boundaries, metadata validation, and idempotent reservation", async () => {
+  await reset();
+  assert.equal((await createUpload(3_000_000_001)).status, 413);
+  assert.equal((await createUpload(0)).status, 413);
+  assert.equal((await createUpload(1.5)).status, 413);
+  assert.equal((await createUpload(1, "a".repeat(256))).status, 400);
+  assert.equal((await request('/api/uploads', {method:'POST',body:'null'})).status, 400);
+  const id = crypto.randomUUID();
+  assert.equal((await createUpload(3_000_000_000, "large.bin", id)).status, 201);
+  assert.equal((await createUpload(3_000_000_000, "large.bin", id)).status, 200);
+  assert.equal((await createUpload(2, "different.bin", id)).status, 409);
+  const board = await boardState();
+  assert.equal(board.files.length, 0);
+  assert.equal(board.storage.reservedBytes, 3_000_000_000);
+  assert.equal(board.limits.totalBytes, 20_000_000_000);
+  await reset();
+});
+
+test("simultaneous reservations never exceed 20 GB and cancellation releases space", async () => {
+  await reset();
+  const responses = await Promise.all(Array.from({ length: 8 }, () => createUpload(3_000_000_000)));
+  assert.equal(responses.filter(response => response.status === 201).length, 6);
+  assert.equal(responses.filter(response => response.status === 413).length, 2);
+  assert.equal((await createUpload(2_000_000_000)).status, 201);
+  assert.equal((await createUpload(1)).status, 413);
+  assert.equal((await boardState()).storage.usedBytes, 20_000_000_000);
+  const session = await responses.find(response => response.status === 201).json();
+  assert.equal((await request(`/api/uploads/${session.id}`, {method:'DELETE'})).status, 200);
+  assert.equal((await createUpload(3_000_000_000)).status, 201);
+  await reset();
+});
+
+test("parts are bounded, validated, hidden until complete, and can be retried", async () => {
+  await reset();
+  const session = await (await createUpload(PART + 3)).json();
+  assert.equal((await request(`/api/uploads/${session.id}/complete`, {method:'POST'})).status, 409);
+  assert.equal((await part(session.id, 0, 'abc')).status, 404);
+  assert.equal((await part(session.id, 3, 'abc')).status, 400);
+  assert.equal((await part(session.id, 2, 'abcd')).status, 400);
+  assert.equal((await part(session.id, 2, 'ab', 3)).status, 400);
+  assert.equal((await part(session.id, 2, 'abcd', 3)).status, 400);
+  assert.equal((await part(session.id, 1, new Uint8Array(PART))).status, 200);
+  assert.equal((await part(session.id, 2, 'old')).status, 200);
+  assert.equal((await part(session.id, 2, 'new')).status, 200);
+  assert.equal((await boardState()).files.length, 0);
+  assert.equal((await request(`/api/files/${session.id}`)).status, 404);
+  const completed = await request(`/api/uploads/${session.id}/complete`, {method:'POST'});
+  assert.equal(completed.status, 201);
+  const file = await completed.json();
+  assert.equal(file.size, PART + 3);
+  assert.equal(file.expiresAt - file.uploadedAt, 259_200_000);
+  assert.equal((await request(`/api/uploads/${session.id}/complete`, {method:'POST'})).status, 200);
+  assert.equal((await request(`/api/uploads/${session.id}`, {method:'DELETE'})).status, 409);
+  const download = await request(`/api/files/${session.id}`, {headers:{Range:`bytes=${PART}-`}});
+  assert.equal(download.status, 206);
+  assert.equal(download.headers.get('Content-Range'), `bytes ${PART}-${PART+2}/${PART+3}`);
+  assert.equal(await download.text(), 'new');
+  assert.equal((await boardState()).storage.reservedBytes, 0);
+  assert.equal((await part(session.id, 2, 'bad')).status, 409);
+  await reset();
+});
+
+test("multipart uploads are aborted on expiry and repeated aborts release reservations", async () => {
+  await reset();
+  const session = await (await createUpload(3)).json();
+  await part(session.id, 1, 'abc');
+  const [file] = await stub.testFiles();
+  await stub.testExpire('files');
+  await stub.testCleanup();
+  assert.equal((await boardState()).storage.usedBytes, 0);
+  await assert.rejects(() => bucket.resumeMultipartUpload(file.key, file.uploadId).uploadPart(1,'abc'));
+  const another = await (await createUpload(3)).json();
+  await stub.testAbortUnderlying(another.id);
+  await request(`/api/uploads/${another.id}`, {method:'DELETE'});
+  assert.equal((await boardState()).storage.usedBytes, 0);
+});
+
+test("completion recovers after R2 succeeds but metadata commit is interrupted", async () => {
+  await reset();
+  const session = await (await createUpload(3)).json();
+  await part(session.id, 1, 'abc');
+  await stub.testLoseCompletion(session.id);
+  const response = await request(`/api/uploads/${session.id}/complete`, {method:'POST'});
+  assert.equal(response.status, 201);
+  assert.equal(await (await request(`/api/files/${session.id}`)).text(), 'abc');
+  await reset();
+});
+
+test("shared browser uploader retries lost create/part responses without duplicate files", async () => {
+  await reset();
+  let lostCreate = false, lostPart = false;
+  const file = new File([new Uint8Array(PART), 'tail'], 'browser-image.png', {type:'image/png'});
+  const fetcher = async (path, options) => {
+    const response = await request(path, options);
+    if(path === '/api/uploads' && !lostCreate) { lostCreate=true; throw new Error('Lost create response'); }
+    if(path.endsWith('/parts/1') && !lostPart) { lostPart=true; throw new Error('Lost part response'); }
+    return response;
+  };
+  const result = await uploadClient(file, {fetch:fetcher});
+  assert.equal(result.previewable, true);
+  assert.equal((await boardState()).files.length, 1);
+  const range = await request(`/api/files/${result.id}`, {headers:{Range:'bytes=-4'}});
+  assert.equal(await range.text(), 'tail');
+  await reset();
+});
+
+test("browser cancellation aborts the session and releases reserved capacity", async () => {
+  await reset();
+  const controller = new AbortController();
+  await assert.rejects(() => uploadClient(new File(['abc'], 'cancel.txt'), {
+    signal: controller.signal, fetch: request,
+    onProgress() { controller.abort(new Error('Upload cancelled.')); },
+  }), /cancelled/);
+  assert.equal((await boardState()).storage.usedBytes, 0);
+});
+
+test("a file larger than 100 MB uploads and streams back with matching SHA-256", async () => {
+  await reset();
+  const size = 4 * PART + 17;
+  const session = await (await createUpload(size)).json();
+  const expected = createHash('sha256');
+  for(let number=1;number<=session.partCount;number++) {
+    const bytes = new Uint8Array(Math.min(PART, size-(number-1)*PART)).fill(number);
+    expected.update(bytes);
+    assert.equal((await part(session.id,number,bytes)).status,200);
+  }
+  assert.equal((await request(`/api/uploads/${session.id}/complete`,{method:'POST'})).status,201);
+  const actual = createHash('sha256');
+  const download = await request(`/api/files/${session.id}`);
+  for await (const chunk of download.body) actual.update(chunk);
+  assert.equal(actual.digest('hex'), expected.digest('hex'));
   await reset();
 });

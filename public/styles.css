@@ -114,3 +114,5 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outlin
   .button { padding-inline: 10px; font-size: 12px; }
   .button-copy { min-width: 74px; }
 }
+
+[hidden] { display: none !important; }

@@ -5,9 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "check": "node --check src/worker.js && node --check public/app.js",
+    "check": "node --check src/worker.js && node --check public/app.js && node --check public/uploads.js",
     "deploy": "wrangler deploy",
-    "test": "node --test tests/*.test.js"
+    "test": "node --test tests/*.test.js && python3 -m unittest discover -s tests -p 'test_*.py'"
   },
   "devDependencies": {
     "miniflare": "5.20261006.0-alpha",

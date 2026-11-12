@@ -1,3 +1,5 @@
+import { uploadFile as multipartUpload } from "/uploads.js";
+
 const input = document.querySelector("#boardInput");
 const copyButton = document.querySelector("#copyButton");
 const clearButton = document.querySelector("#clearButton");
@@ -9,13 +11,14 @@ const timerRing = document.querySelector("#timerRing");
 const toast = document.querySelector("#toast");
 const fileInput = document.querySelector("#fileInput");
 const uploadButton = document.querySelector("#uploadButton");
+const cancelUploadButton = document.querySelector("#cancelUploadButton");
 const dropZone = document.querySelector("#dropZone");
 const fileList = document.querySelector("#fileList");
 const fileSummary = document.querySelector("#fileSummary");
 const uploadState = document.querySelector("#uploadState");
 
 const DAY = 24 * 60 * 60 * 1000;
-const MAX_FILE_SIZE = 20 * 1024 * 1024;
+const MAX_FILE_SIZE = 3_000_000_000;
 let expiresAt = 0;
 let dirty = false;
 let version = 0;
@@ -24,6 +27,8 @@ let saving = null;
 let loading = false;
 let clearing = false;
 let uploading = false;
+let uploadController;
+let storageUsage = null;
 let files = [];
 let fileSignature = "";
 let saveTimer;
@@ -70,7 +75,7 @@ clearButton.addEventListener("click", async () => {
     dirty = false;
     version++;
     expiresAt = 0;
-    renderFiles(data.files);
+    renderFiles(data.files, data.storage);
     setSaveState("Board cleared");
     showToast("Text and files cleared");
   } catch (error) { setSaveState(error.message, true); }
@@ -84,6 +89,7 @@ clearButton.addEventListener("click", async () => {
 });
 
 uploadButton.addEventListener("click", () => fileInput.click());
+cancelUploadButton.addEventListener("click", () => uploadController?.abort(new Error("Upload cancelled.")));
 fileInput.addEventListener("change", () => {
   const selected = [...fileInput.files];
   fileInput.value = "";
@@ -136,7 +142,7 @@ async function load() {
       updateCount();
       setSaveState(data.text ? "Synced across devices" : "Ready for something new");
     }
-    renderFiles(data.files);
+    renderFiles(data.files, data.storage);
     setConnected(true);
   } catch {
     setConnected(false);
@@ -180,21 +186,24 @@ async function save() {
 async function uploadFiles(selected) {
   if (!selected.length || uploading || clearing) return;
   uploading = true;
+  uploadController = new AbortController();
   epoch++;
   updateCount();
   let succeeded = 0;
   const errors = [];
   for (const file of selected) {
+    if (uploadController.signal.aborted) { errors.push("Upload cancelled."); break; }
     if (!file.size || file.size > MAX_FILE_SIZE) {
-      errors.push(`${file.name}: choose a file between 1 byte and 20 MB.`);
+      errors.push(`${file.name}: choose a file between 1 byte and 3 GB.`);
       continue;
     }
     try {
-      await uploadFile(file);
+      await uploadFile(file, uploadController.signal);
       succeeded++;
     } catch (error) { errors.push(`${file.name}: ${error.message}`); }
   }
   uploading = false;
+  uploadController = null;
   epoch++;
   updateCount();
   uploadState.textContent = errors.length ? errors.join(" · ") : `${succeeded} file${succeeded === 1 ? "" : "s"} uploaded. Each expires in 3 days.`;
@@ -203,38 +212,24 @@ async function uploadFiles(selected) {
   void load();
 }
 
-function uploadFile(file) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/files");
-    xhr.timeout = 120_000;
-    xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
-    xhr.setRequestHeader("X-File-Name", encodeURIComponent(file.name));
-    uploadState.classList.remove("is-error");
-    uploadState.textContent = `Uploading ${file.name}…`;
-    xhr.upload.addEventListener("progress", event => {
-      if (event.lengthComputable) uploadState.textContent = `Uploading ${file.name} · ${Math.round(event.loaded / event.total * 100)}%`;
-    });
-    xhr.addEventListener("load", () => {
-      let data;
-      try { data = JSON.parse(xhr.responseText); }
-      catch { reject(new Error("Unexpected server response.")); return; }
-      if (xhr.status >= 200 && xhr.status < 300) resolve(data);
-      else reject(new Error(data.error || "Upload failed."));
-    });
-    xhr.addEventListener("error", () => reject(new Error("Connection lost. Please try again.")));
-    xhr.addEventListener("timeout", () => reject(new Error("Upload timed out. Please try again.")));
-    xhr.send(file);
+async function uploadFile(file, signal) {
+  uploadState.classList.remove("is-error");
+  return multipartUpload(file, {
+    signal,
+    onProgress: ({ loaded, total, part, parts }) => {
+      uploadState.textContent = `Uploading ${file.name} · ${Math.round(loaded / total * 100)}% · Part ${part}/${parts}`;
+    },
   });
 }
 
-function renderFiles(nextFiles = []) {
+function renderFiles(nextFiles = [], storage = null) {
+  if (storage) storageUsage = storage;
   files = nextFiles.filter(file => file.expiresAt > Date.now());
-  const signature = JSON.stringify(files);
+  const signature = JSON.stringify([files, storageUsage]);
   if (signature === fileSignature) return;
   fileSignature = signature;
   fileList.replaceChildren();
-  fileSummary.textContent = `${files.length}/20 files · ${formatSize(files.reduce((total, file) => total + file.size, 0))} / 100 MB`;
+  fileSummary.textContent = `${files.length}/20 files · ${formatSize(storageUsage?.usedBytes ?? files.reduce((total, file) => total + file.size, 0))} / 20 GB${storageUsage?.reservedBytes ? " (including uploads)" : ""}`;
   for (const file of files) {
     const card = document.createElement("article");
     card.className = "file-card";
@@ -281,7 +276,7 @@ function renderFiles(nextFiles = []) {
       epoch++;
       try {
         const data = await api(`/api/files/${file.id}`, { method: "DELETE" });
-        renderFiles(data.files);
+        renderFiles(data.files, data.storage);
         showToast("File deleted");
       } catch (error) { showToast(error.message); remove.disabled = false; }
       finally { epoch++; }
@@ -294,9 +289,10 @@ function renderFiles(nextFiles = []) {
 }
 
 function formatSize(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  if (bytes < 1000) return `${bytes} B`;
+  if (bytes < 1_000_000) return `${(bytes / 1000).toFixed(1)} KB`;
+  if (bytes < 1_000_000_000) return `${(bytes / 1_000_000).toFixed(1)} MB`;
+  return `${(bytes / 1_000_000_000).toFixed(2)} GB`;
 }
 function formatTime(milliseconds) {
   const seconds = Math.max(0, Math.ceil(milliseconds / 1000));
@@ -320,6 +316,8 @@ function updateCount() {
   copyButton.disabled = !input.value || clearing;
   clearButton.disabled = clearing || uploading || (!input.value && !files.length);
   uploadButton.disabled = uploading || clearing;
+  cancelUploadButton.hidden = !uploading;
+  cancelUploadButton.disabled = Boolean(uploadController?.signal.aborted);
   dropZone.setAttribute("aria-busy", String(uploading));
 }
 function setConnected(connected) {

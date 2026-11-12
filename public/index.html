@@ -58,14 +58,15 @@
       <section class="attachments" aria-labelledby="filesTitle">
         <div class="attachments-heading">
           <h2 id="filesTitle">Images &amp; files</h2>
-          <span id="fileSummary">0/20 files · 0 B / 100 MB</span>
+          <span id="fileSummary">0/20 files · 0 B / 20 GB</span>
         </div>
         <div class="drop-zone" id="dropZone">
           <div>
             <strong>Drop files here, or paste a screenshot.</strong>
-            <p>Up to 20 MB per file · Each upload stays for 3 days</p>
+            <p>Up to 3 GB per file · 20 GB total · Each upload stays for 3 days</p>
           </div>
           <button class="button button-copy" id="uploadButton" type="button">Upload files</button>
+          <button class="button button-quiet" id="cancelUploadButton" type="button" hidden>Cancel upload</button>
           <input class="sr-only" id="fileInput" type="file" multiple aria-label="Choose files to upload" />
         </div>
         <p class="upload-state" id="uploadState" role="status" aria-live="polite"></p>
