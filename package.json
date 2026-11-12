@@ -6,9 +6,11 @@
   "scripts": {
     "dev": "wrangler dev",
     "check": "node --check src/worker.js && node --check public/app.js",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test": "node --test tests/*.test.js"
   },
   "devDependencies": {
+    "miniflare": "5.20261006.0-alpha",
     "wrangler": "^4.92.0"
   }
 }

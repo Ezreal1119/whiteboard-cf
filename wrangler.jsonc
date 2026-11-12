@@ -30,7 +30,13 @@
       "new_sqlite_classes": ["ClipboardBoard"]
     }
   ],
+  "r2_buckets": [
+    {
+      "binding": "ATTACHMENTS",
+      "bucket_name": "whiteboard-attachments"
+    }
+  ],
   "vars": {
-    "BOARD_TTL_SECONDS": "600"
+    "BOARD_TTL_SECONDS": "86400"
   }
 }

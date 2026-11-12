@@ -7,152 +7,337 @@ const syncLabel = document.querySelector("#syncLabel");
 const timerValue = document.querySelector("#timerValue");
 const timerRing = document.querySelector("#timerRing");
 const toast = document.querySelector("#toast");
+const fileInput = document.querySelector("#fileInput");
+const uploadButton = document.querySelector("#uploadButton");
+const dropZone = document.querySelector("#dropZone");
+const fileList = document.querySelector("#fileList");
+const fileSummary = document.querySelector("#fileSummary");
+const uploadState = document.querySelector("#uploadState");
 
-const apiUrl = "/api/board";
-const ttlMilliseconds = 10 * 60 * 1000;
+const DAY = 24 * 60 * 60 * 1000;
+const MAX_FILE_SIZE = 20 * 1024 * 1024;
 let expiresAt = 0;
-let latestUpdatedAt = 0;
 let dirty = false;
+let version = 0;
+let epoch = 0;
+let saving = null;
+let loading = false;
+let clearing = false;
+let uploading = false;
+let files = [];
+let fileSignature = "";
 let saveTimer;
 let toastTimer;
 
 input.addEventListener("input", () => {
   dirty = true;
+  version++;
+  epoch++;
   updateCount();
   setSaveState("Waiting to save");
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(save, 650);
+  queueSave(650);
 });
-
-input.addEventListener("keydown", (event) => {
+input.addEventListener("keydown", event => {
   if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
     event.preventDefault();
     clearTimeout(saveTimer);
     void save();
   }
 });
-
 copyButton.addEventListener("click", async () => {
-  try {
-    await navigator.clipboard.writeText(input.value);
-  } catch {
+  try { await navigator.clipboard.writeText(input.value); }
+  catch {
     input.select();
     document.execCommand("copy");
     input.setSelectionRange(input.value.length, input.value.length);
   }
   showToast(input.value ? "Copied to clipboard" : "The board is empty");
 });
-
 clearButton.addEventListener("click", async () => {
+  if (clearing || uploading) return;
+  clearing = true;
+  epoch++;
   clearTimeout(saveTimer);
-  dirty = false;
-  input.value = "";
+  input.disabled = true;
   updateCount();
   setSaveState("Clearing…");
   try {
-    const response = await fetch(apiUrl, { method: "DELETE" });
-    if (!response.ok) throw new Error("Could not clear the board.");
+    // Finish any pending save before clearing so it cannot restore deleted text.
+    if (saving) await saving;
+    clearTimeout(saveTimer);
+    const data = await api("/api/board", { method: "DELETE" });
+    input.value = data.text;
+    dirty = false;
+    version++;
     expiresAt = 0;
-    latestUpdatedAt = 0;
+    renderFiles(data.files);
     setSaveState("Board cleared");
-    showToast("Board cleared");
-  } catch (error) {
-    setSaveState(error.message, true);
+    showToast("Text and files cleared");
+  } catch (error) { setSaveState(error.message, true); }
+  finally {
+    clearing = false;
+    input.disabled = false;
+    epoch++;
+    updateCount();
+    if (dirty) queueSave(650);
   }
 });
 
+uploadButton.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => {
+  const selected = [...fileInput.files];
+  fileInput.value = "";
+  void uploadFiles(selected);
+});
+for (const eventName of ["dragenter", "dragover"]) {
+  dropZone.addEventListener(eventName, event => {
+    event.preventDefault();
+    dropZone.classList.add("is-dragging");
+  });
+}
+for (const eventName of ["dragleave", "drop"]) {
+  dropZone.addEventListener(eventName, event => {
+    event.preventDefault();
+    dropZone.classList.remove("is-dragging");
+  });
+}
+dropZone.addEventListener("drop", event => void uploadFiles([...event.dataTransfer.files]));
+document.addEventListener("paste", event => {
+  const pasted = [...(event.clipboardData?.files || [])];
+  if (pasted.length) {
+    event.preventDefault();
+    void uploadFiles(pasted);
+  }
+});
 window.addEventListener("focus", () => void load());
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") void load();
 });
 
+async function api(url, options = {}) {
+  const response = await fetch(url, { cache: "no-store", ...options });
+  let data;
+  try { data = await response.json(); }
+  catch { throw new Error("Unexpected server response. Please try again."); }
+  if (!response.ok) throw new Error(data.error || "Could not connect. Please try again.");
+  return data;
+}
+
 async function load() {
+  if (loading || clearing) return;
+  loading = true;
+  const startedAt = epoch;
   try {
-    const response = await fetch(apiUrl, { cache: "no-store" });
-    if (!response.ok) throw new Error("Could not connect");
-    const data = await response.json();
-    if (!dirty && data.updatedAt >= latestUpdatedAt) {
+    const data = await api("/api/board");
+    if (startedAt !== epoch || clearing) return;
+    if (!dirty && !saving) {
       input.value = data.text;
-      latestUpdatedAt = data.updatedAt;
-      expiresAt = data.expiresAt;
+      expiresAt = data.text ? data.expiresAt : 0;
       updateCount();
+      setSaveState(data.text ? "Synced across devices" : "Ready for something new");
     }
+    renderFiles(data.files);
     setConnected(true);
-    setSaveState(data.text ? "Synced across devices" : "Ready for something new");
   } catch {
     setConnected(false);
-    setSaveState("Offline — changes will retry", true);
-  }
+    if (!dirty && !saving) setSaveState("Offline — reconnecting…", true);
+  } finally { loading = false; }
+}
+
+function queueSave(delay) {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => void save(), delay);
 }
 
 async function save() {
+  if (saving || clearing || !dirty) return;
+  const savedVersion = version;
   const text = input.value;
+  epoch++;
   setSaveState("Saving…");
-  try {
-    const response = await fetch(apiUrl, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
-    });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || "Could not save the board.");
-    dirty = false;
-    latestUpdatedAt = data.updatedAt;
-    expiresAt = data.expiresAt;
-    setConnected(true);
-    setSaveState(text ? "Saved just now" : "Board cleared");
-  } catch (error) {
-    dirty = true;
-    setConnected(false);
-    setSaveState(error.message, true);
-    clearTimeout(saveTimer);
-    saveTimer = setTimeout(save, 3000);
-  }
+  saving = (async () => {
+    try {
+      const data = await api("/api/board", {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }),
+      });
+      if (savedVersion === version) {
+        dirty = false;
+        expiresAt = text ? data.expiresAt : 0;
+        setSaveState(text ? "Saved just now" : "Text cleared — files kept");
+      }
+      setConnected(true);
+    } catch (error) {
+      setConnected(false);
+      setSaveState(error.message, true);
+    }
+  })();
+  await saving;
+  saving = null;
+  epoch++;
+  if (dirty && !clearing) queueSave(savedVersion === version ? 3000 : 0);
 }
 
+async function uploadFiles(selected) {
+  if (!selected.length || uploading || clearing) return;
+  uploading = true;
+  epoch++;
+  updateCount();
+  let succeeded = 0;
+  const errors = [];
+  for (const file of selected) {
+    if (!file.size || file.size > MAX_FILE_SIZE) {
+      errors.push(`${file.name}: choose a file between 1 byte and 20 MB.`);
+      continue;
+    }
+    try {
+      await uploadFile(file);
+      succeeded++;
+    } catch (error) { errors.push(`${file.name}: ${error.message}`); }
+  }
+  uploading = false;
+  epoch++;
+  updateCount();
+  uploadState.textContent = errors.length ? errors.join(" · ") : `${succeeded} file${succeeded === 1 ? "" : "s"} uploaded. Each expires in 24 hours.`;
+  uploadState.classList.toggle("is-error", Boolean(errors.length));
+  if (succeeded) showToast(`${succeeded} file${succeeded === 1 ? "" : "s"} uploaded`);
+  void load();
+}
+
+function uploadFile(file) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/files");
+    xhr.timeout = 120_000;
+    xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
+    xhr.setRequestHeader("X-File-Name", encodeURIComponent(file.name));
+    uploadState.classList.remove("is-error");
+    uploadState.textContent = `Uploading ${file.name}…`;
+    xhr.upload.addEventListener("progress", event => {
+      if (event.lengthComputable) uploadState.textContent = `Uploading ${file.name} · ${Math.round(event.loaded / event.total * 100)}%`;
+    });
+    xhr.addEventListener("load", () => {
+      let data;
+      try { data = JSON.parse(xhr.responseText); }
+      catch { reject(new Error("Unexpected server response.")); return; }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+      else reject(new Error(data.error || "Upload failed."));
+    });
+    xhr.addEventListener("error", () => reject(new Error("Connection lost. Please try again.")));
+    xhr.addEventListener("timeout", () => reject(new Error("Upload timed out. Please try again.")));
+    xhr.send(file);
+  });
+}
+
+function renderFiles(nextFiles = []) {
+  files = nextFiles.filter(file => file.expiresAt > Date.now());
+  const signature = JSON.stringify(files);
+  if (signature === fileSignature) return;
+  fileSignature = signature;
+  fileList.replaceChildren();
+  fileSummary.textContent = `${files.length}/20 files · ${formatSize(files.reduce((total, file) => total + file.size, 0))} / 100 MB`;
+  for (const file of files) {
+    const card = document.createElement("article");
+    card.className = "file-card";
+    const link = document.createElement("a");
+    link.className = "file-preview";
+    link.href = `/api/files/${file.id}${file.previewable ? "" : "?download"}`;
+    link.target = "_blank";
+    link.rel = "noopener";
+    if (file.previewable) {
+      const img = document.createElement("img");
+      img.src = `/api/files/${file.id}`;
+      img.alt = file.name;
+      img.loading = "lazy";
+      link.append(img);
+    } else {
+      const label = document.createElement("span");
+      label.className = "file-extension";
+      label.textContent = file.name.split(".").pop().slice(0, 8).toUpperCase();
+      link.append(label);
+      link.setAttribute("aria-label", `Download ${file.name}`);
+    }
+    const name = document.createElement("strong");
+    name.className = "file-name";
+    name.textContent = file.name;
+    name.title = file.name;
+    const meta = document.createElement("p");
+    meta.className = "file-meta";
+    const remaining = document.createElement("span");
+    remaining.dataset.expires = String(file.expiresAt);
+    remaining.textContent = `${formatTime(file.expiresAt - Date.now())} left`;
+    meta.append(`${formatSize(file.size)} · `, remaining);
+    const actions = document.createElement("div");
+    actions.className = "file-actions";
+    const download = document.createElement("a");
+    download.href = `/api/files/${file.id}?download`;
+    download.textContent = "Download";
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "Delete";
+    remove.setAttribute("aria-label", `Delete ${file.name}`);
+    remove.addEventListener("click", async () => {
+      if (clearing) return;
+      remove.disabled = true;
+      epoch++;
+      try {
+        const data = await api(`/api/files/${file.id}`, { method: "DELETE" });
+        renderFiles(data.files);
+        showToast("File deleted");
+      } catch (error) { showToast(error.message); remove.disabled = false; }
+      finally { epoch++; }
+    });
+    actions.append(download, remove);
+    card.append(link, name, meta, actions);
+    fileList.append(card);
+  }
+  updateCount();
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+function formatTime(milliseconds) {
+  const seconds = Math.max(0, Math.ceil(milliseconds / 1000));
+  return [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60].map(part => String(part).padStart(2, "0")).join(":");
+}
 function updateTimer() {
   const remaining = Math.max(0, expiresAt - Date.now());
-  const totalSeconds = Math.ceil(remaining / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  timerValue.textContent = expiresAt ? `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}` : "10:00";
-  timerRing.style.setProperty("--progress", `${remaining / ttlMilliseconds * 360}deg`);
-  if (expiresAt && remaining === 0 && !dirty) {
+  timerValue.textContent = expiresAt ? formatTime(remaining) : "24:00:00";
+  timerRing.style.setProperty("--progress", `${Math.min(1, remaining / DAY) * 360}deg`);
+  if (expiresAt && remaining === 0 && !dirty && !saving) {
     expiresAt = 0;
-    latestUpdatedAt = 0;
     input.value = "";
     updateCount();
-    setSaveState("Expired and cleared");
+    setSaveState("Text expired and cleared");
   }
+  if (files.some(file => file.expiresAt <= Date.now())) renderFiles(files);
+  for (const label of fileList.querySelectorAll("[data-expires]")) label.textContent = `${formatTime(Number(label.dataset.expires) - Date.now())} left`;
 }
-
 function updateCount() {
   characterCount.textContent = input.value.length.toLocaleString();
-  copyButton.disabled = !input.value;
-  clearButton.disabled = !input.value;
+  copyButton.disabled = !input.value || clearing;
+  clearButton.disabled = clearing || uploading || (!input.value && !files.length);
+  uploadButton.disabled = uploading || clearing;
+  dropZone.setAttribute("aria-busy", String(uploading));
 }
-
 function setConnected(connected) {
   syncLabel.textContent = connected ? "Live sync" : "Offline";
   document.querySelector(".live-state").classList.toggle("is-offline", !connected);
 }
-
 function setSaveState(message, isError = false) {
   saveState.textContent = message;
   saveState.classList.toggle("is-error", isError);
 }
-
 function showToast(message) {
   clearTimeout(toastTimer);
   toast.textContent = message;
   toast.classList.add("is-visible");
-  toastTimer = setTimeout(() => toast.classList.remove("is-visible"), 1800);
+  toastTimer = setTimeout(() => toast.classList.remove("is-visible"), 3000);
 }
-
 updateCount();
 updateTimer();
 void load();
-setInterval(updateTimer, 250);
-setInterval(() => {
-  if (!dirty) void load();
-}, 4000);
+setInterval(updateTimer, 1000);
+setInterval(() => void load(), 4000);

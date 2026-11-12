@@ -4,17 +4,17 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#f3efe7" />
-    <meta name="description" content="A private, temporary text board that clears itself after ten minutes." />
+    <meta name="description" content="A temporary clipboard for text, images, and files, with 24-hour expiry." />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/styles.css" />
-    <title>Ten Minute Board</title>
+    <title>One Day Board</title>
   </head>
   <body>
     <main class="page-shell">
       <header class="masthead">
-        <a class="wordmark" href="#board" aria-label="Ten Minute Board">
+        <a class="wordmark" href="#board" aria-label="One Day Board">
           <span class="wordmark-dot" aria-hidden="true"></span>
-          <span>Ten Minute Board</span>
+          <span>One Day Board</span>
         </a>
         <div class="live-state" aria-live="polite">
           <span class="live-dot"></span>
@@ -25,7 +25,7 @@
       <section class="intro" aria-labelledby="pageTitle">
         <p class="eyebrow">TEMPORARY CLIPBOARD</p>
         <h1 id="pageTitle">Type it here.<br />Pick it up anywhere.</h1>
-        <p class="intro-copy">This board syncs across your devices and clears itself ten minutes after the last edit.</p>
+        <p class="intro-copy">Text, images, and files. Across your devices. Text expires 24 hours after the last edit; files expire 24 hours after upload.</p>
       </section>
 
       <section class="board-card" id="board" aria-label="Temporary clipboard">
@@ -33,12 +33,12 @@
           <div class="timer-group">
             <span class="timer-ring" id="timerRing" aria-hidden="true"></span>
             <div>
-              <span class="timer-label">TIME REMAINING</span>
-              <strong id="timerValue">10:00</strong>
+              <span class="timer-label">TEXT TIME REMAINING</span>
+              <strong id="timerValue">24:00:00</strong>
             </div>
           </div>
           <div class="toolbar-actions">
-            <button class="button button-quiet" id="clearButton" type="button">Clear</button>
+            <button class="button button-quiet" id="clearButton" type="button">Clear all</button>
             <button class="button button-copy" id="copyButton" type="button">
               <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>
               <span>Copy</span>
@@ -55,7 +55,24 @@
         </footer>
       </section>
 
-      <p class="privacy-note"><span aria-hidden="true">×</span> Nothing here is permanent. The board is deleted automatically after ten quiet minutes.</p>
+      <section class="attachments" aria-labelledby="filesTitle">
+        <div class="attachments-heading">
+          <h2 id="filesTitle">Images &amp; files</h2>
+          <span id="fileSummary">0/20 files · 0 B / 100 MB</span>
+        </div>
+        <div class="drop-zone" id="dropZone">
+          <div>
+            <strong>Drop files here, or paste a screenshot.</strong>
+            <p>Up to 20 MB per file · Each upload stays for 24 hours</p>
+          </div>
+          <button class="button button-copy" id="uploadButton" type="button">Upload files</button>
+          <input class="sr-only" id="fileInput" type="file" multiple aria-label="Choose files to upload" />
+        </div>
+        <p class="upload-state" id="uploadState" role="status" aria-live="polite"></p>
+        <div class="file-list" id="fileList"></div>
+      </section>
+
+      <p class="privacy-note"><span aria-hidden="true">×</span> Nothing here is permanent. Text and files expire automatically after 24 hours.</p>
     </main>
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
     <script type="module" src="/app.js"></script>
