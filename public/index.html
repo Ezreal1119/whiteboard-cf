@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#f3efe7" />
-    <meta name="description" content="A temporary clipboard for text, images, and files, with 24-hour expiry." />
+    <meta name="description" content="A temporary clipboard: text stays for one day, images and files for three days." />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/styles.css" />
     <title>One Day Board</title>
@@ -25,7 +25,7 @@
       <section class="intro" aria-labelledby="pageTitle">
         <p class="eyebrow">TEMPORARY CLIPBOARD</p>
         <h1 id="pageTitle">Type it here.<br />Pick it up anywhere.</h1>
-        <p class="intro-copy">Text, images, and files. Across your devices. Text expires 24 hours after the last edit; files expire 24 hours after upload.</p>
+        <p class="intro-copy">Text, images, and files. Across your devices. Text expires 24 hours after the last edit; files expire 3 days after upload.</p>
       </section>
 
       <section class="board-card" id="board" aria-label="Temporary clipboard">
@@ -63,7 +63,7 @@
         <div class="drop-zone" id="dropZone">
           <div>
             <strong>Drop files here, or paste a screenshot.</strong>
-            <p>Up to 20 MB per file · Each upload stays for 24 hours</p>
+            <p>Up to 20 MB per file · Each upload stays for 3 days</p>
           </div>
           <button class="button button-copy" id="uploadButton" type="button">Upload files</button>
           <input class="sr-only" id="fileInput" type="file" multiple aria-label="Choose files to upload" />
@@ -72,7 +72,7 @@
         <div class="file-list" id="fileList"></div>
       </section>
 
-      <p class="privacy-note"><span aria-hidden="true">×</span> Nothing here is permanent. Text and files expire automatically after 24 hours.</p>
+      <p class="privacy-note"><span aria-hidden="true">×</span> Nothing here is permanent. Text expires after 1 day; images and files after 3 days.</p>
     </main>
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
     <script type="module" src="/app.js"></script>

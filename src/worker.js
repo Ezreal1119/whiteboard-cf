@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 const DAY = 86_400_000;
+const FILE_RETENTION = 3 * DAY;
 const MAX_TEXT_LENGTH = 100_000;
 const MAX_FILE_SIZE = 20 * 1024 * 1024;
 const MAX_FILES = 20;
@@ -51,6 +52,7 @@ export class ClipboardBoard extends DurableObject {
   // Serialize metadata + R2 operations, including alarms. Storage transactions alone
   // cannot protect the external R2 writes from a concurrent clear or expiry.
   queue = Promise.resolve();
+  retentionMigrated = false;
 
   exclusive(operation) {
     const next = this.queue.then(operation);
@@ -60,6 +62,7 @@ export class ClipboardBoard extends DurableObject {
 
   fetch(request) {
     return this.exclusive(async () => {
+      await this.migrateFileRetention();
       const url = new URL(request.url);
       if (url.pathname === "/api/board") {
         if (request.method === "GET") return json(await this.snapshot());
@@ -76,6 +79,23 @@ export class ClipboardBoard extends DurableObject {
       if (request.method === "DELETE") return this.remove(id);
       return json({ error: "Method not allowed." }, 405, { Allow: "GET, HEAD, DELETE" });
     });
+  }
+
+  async migrateFileRetention() {
+    if (this.retentionMigrated) return;
+    const now = Date.now();
+    let changed = false;
+    for (const file of await this.files()) {
+      // Extend only live files saved under the previous one-day policy.
+      // Deleted, expired and unfinished files must never be restored.
+      if (file.status === "ready" && file.expiresAt > now && file.expiresAt === file.uploadedAt + DAY) {
+        file.expiresAt = file.uploadedAt + FILE_RETENTION;
+        await this.ctx.storage.put(`file:${file.id}`, file);
+        changed = true;
+      }
+    }
+    if (changed) await this.schedule();
+    this.retentionMigrated = true;
   }
 
   async files() {
@@ -126,7 +146,7 @@ export class ClipboardBoard extends DurableObject {
     }
     const id = crypto.randomUUID();
     const type = (request.headers.get("Content-Type") || "application/octet-stream").split(";")[0].toLowerCase();
-    const file = { id, key: `attachments/${id}`, name, size, type, uploadedAt: Date.now(), expiresAt: Date.now() + DAY, status: "uploading" };
+    const file = { id, key: `attachments/${id}`, name, size, type, uploadedAt: Date.now(), expiresAt: Date.now() + FILE_RETENTION, status: "uploading" };
     // Persist the object key and schedule cleanup before writing to R2 so crashes
     // never leave an untracked object. Pending uploads are never downloadable.
     await this.ctx.storage.put(`file:${id}`, file);
@@ -135,7 +155,7 @@ export class ClipboardBoard extends DurableObject {
       await this.env.ATTACHMENTS.put(file.key, request.body, { httpMetadata: { contentType: type } });
       file.status = "ready";
       file.uploadedAt = Date.now();
-      file.expiresAt = file.uploadedAt + DAY;
+      file.expiresAt = file.uploadedAt + FILE_RETENTION;
       await this.ctx.storage.put(`file:${id}`, file);
       await this.schedule();
       return json(publicFile(file), 201);
@@ -219,7 +239,10 @@ export class ClipboardBoard extends DurableObject {
   }
 
   alarm() {
-    return this.exclusive(() => this.cleanup());
+    return this.exclusive(async () => {
+      await this.migrateFileRetention();
+      await this.cleanup();
+    });
   }
 }
 

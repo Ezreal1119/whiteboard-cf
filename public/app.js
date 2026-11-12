@@ -197,7 +197,7 @@ async function uploadFiles(selected) {
   uploading = false;
   epoch++;
   updateCount();
-  uploadState.textContent = errors.length ? errors.join(" · ") : `${succeeded} file${succeeded === 1 ? "" : "s"} uploaded. Each expires in 24 hours.`;
+  uploadState.textContent = errors.length ? errors.join(" · ") : `${succeeded} file${succeeded === 1 ? "" : "s"} uploaded. Each expires in 3 days.`;
   uploadState.classList.toggle("is-error", Boolean(errors.length));
   if (succeeded) showToast(`${succeeded} file${succeeded === 1 ? "" : "s"} uploaded`);
   void load();

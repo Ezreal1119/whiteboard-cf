@@ -30,6 +30,15 @@ export class TestBoard extends ClipboardBoard {
     await this.ctx.storage.put('file:' + file.id, file);
     await this.env.ATTACHMENTS.put(file.key, 'abc');
   }
+  async testLegacyFile(expired = false) {
+    const uploadedAt = Date.now() - (expired ? DAY + 1000 : 1000);
+    const file = { id: crypto.randomUUID(), name: 'legacy.txt', size: 3, type: 'text/plain', uploadedAt, expiresAt: uploadedAt + DAY, status: 'ready' };
+    file.key = 'attachments/' + file.id;
+    await this.ctx.storage.put('file:' + file.id, file);
+    await this.env.ATTACHMENTS.put(file.key, 'abc');
+    this.retentionMigrated = false;
+    return file;
+  }
   async testQuota(size) {
     const files = await this.files();
     files[0].size = size;
@@ -88,7 +97,7 @@ test("upload, cross-device list, preview and download preserve original bytes", 
   assert.equal(response.status, 201);
   const file = await response.json();
   assert.equal(file.name, "测试截图.png");
-  assert.equal(file.expiresAt - file.uploadedAt, 86_400_000);
+  assert.equal(file.expiresAt - file.uploadedAt, 259_200_000);
   assert.equal(file.previewable, true);
   const board = await (await request("/api/board")).json();
   assert.equal(board.files[0].id, file.id);
@@ -179,5 +188,19 @@ test("a file exactly at the 20 MB boundary is accepted intact", async () => {
   assert.equal(file.size, 20 * 1024 * 1024);
   const stored = await bucket.head(`attachments/${file.id}`);
   assert.equal(stored.size, file.size);
+  await reset();
+});
+
+test("live one-day attachments migrate to three days without restoring expired files", async () => {
+  await reset();
+  const live = await stub.testLegacyFile();
+  const expired = await stub.testLegacyFile(true);
+  const board = await (await request("/api/board")).json();
+  assert.equal(board.files.length, 1);
+  assert.equal(board.files[0].id, live.id);
+  assert.equal(board.files[0].expiresAt, live.uploadedAt + 259_200_000);
+  assert.equal((await request(`/api/files/${expired.id}`)).status, 404);
+  await stub.testCleanup();
+  assert.equal((await request(`/api/files/${live.id}`)).status, 200);
   await reset();
 });
