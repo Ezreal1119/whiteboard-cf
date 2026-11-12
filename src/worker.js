@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { abortRcloneParts, rcloneConfig, stopTokenHash } from "./rclone-storage.js";
 
 const DAY = 86_400_000;
 const FILE_RETENTION = 3 * DAY;
@@ -10,13 +11,14 @@ const UPLOAD_TTL = DAY;
 const MAX_FILES = 20;
 const MAX_TOTAL_SIZE = 20_000_000_000;
 const UUID = "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}";
-const UPLOAD_PATH = new RegExp(`^/api/uploads/(${UUID})(?:/(complete|parts/[1-9][0-9]*))?$`);
+const UPLOAD_PATH = new RegExp(`^/api/uploads/(${UUID})(?:/(complete|cancel|parts/[1-9][0-9]*))?$`);
 const RETRY_DELAY = 60_000;
 const INLINE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif"]);
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname === "/api/uploads/config" && request.method === "GET") return json({ rclone: rcloneConfig(env) });
     const isAPI = url.pathname === "/api/board" || url.pathname === "/api/files"
       || new RegExp(`^/api/files/${UUID}$`).test(url.pathname)
       || url.pathname === "/api/uploads" || UPLOAD_PATH.test(url.pathname);
@@ -31,9 +33,11 @@ export default {
       headers.set("X-Board-TTL", String(env.BOARD_TTL_SECONDS || 86400));
       const isText = url.pathname === "/api/board" && request.method === "PUT";
       const isCreate = url.pathname === "/api/uploads" && request.method === "POST";
-      if (isText || isCreate) {
+      const isControl = UPLOAD_PATH.test(url.pathname) && /\/(complete|cancel)$/.test(url.pathname) && request.method === "POST" && request.body;
+      if (isText || isCreate || isControl) {
         const bytes = await readLimitedBody(request, isText ? 1_200_000 : 8192);
         if (bytes instanceof Response) return bytes;
+        if (isControl && !bytes.byteLength) return board.fetch(new Request(request.url, { method: request.method, headers }));
         let body;
         try { body = JSON.parse(new TextDecoder().decode(bytes)); }
         catch { return json({ error: "The request body must be valid JSON." }, 400); }
@@ -96,7 +100,8 @@ export class ClipboardBoard extends DurableObject {
         const [, uploadId, action] = uploadMatch;
         if (!action && request.method === "GET") return this.uploadStatus(uploadId);
         if (!action && request.method === "DELETE") return this.abortUpload(uploadId);
-        if (action === "complete" && request.method === "POST") return this.completeUpload(uploadId);
+        if (action === "complete" && request.method === "POST") return this.completeUpload(uploadId, request);
+        if (action === "cancel" && request.method === "POST") return this.abortUpload(uploadId, request);
         if (action?.startsWith("parts/") && request.method === "PUT") return this.uploadPart(uploadId, Number(action.slice(6)), request);
         return json({ error: "Method not allowed." }, 405);
       }
@@ -183,7 +188,7 @@ export class ClipboardBoard extends DurableObject {
     if (files.length >= MAX_FILES || files.reduce((sum, file) => sum + file.size, 0) + metadata.size > MAX_TOTAL_SIZE) {
       return json({ error: "The board can hold 20 files and 20 GB in total, including uploads in progress. Remove a file or cancel an upload first." }, 413);
     }
-    const file = { ...metadata, id, key: `attachments/${id}`, uploadedAt: 0, expiresAt: Date.now() + UPLOAD_TTL, status: "creating" };
+    const file = { ...metadata, id, key: `attachments/${id}`, uploadedAt: 0, createdAt: Date.now(), expiresAt: Date.now() + UPLOAD_TTL, status: "creating" };
     await this.ctx.storage.put(`file:${id}`, file);
     await this.schedule();
     return file;
@@ -223,6 +228,7 @@ export class ClipboardBoard extends DurableObject {
   }
 
   session(file) {
+    if (file.mode === "rclone") return { id: file.id, mode: "rclone", status: file.status, size: file.size, expiresAt: file.expiresAt, bucket: rcloneConfig(this.env).bucket, key: file.key, ...(file.status === "ready" ? { file: publicFile(file) } : {}) };
     return { id: file.id, status: file.status, size: file.size, partSize: PART_SIZE, partCount: Math.ceil(file.size / PART_SIZE), expiresAt: file.expiresAt, uploadedParts: Object.values(file.parts || {}).map(part => part.partNumber), ...(file.status === "ready" ? { file: publicFile(file) } : {}) };
   }
 
@@ -232,16 +238,26 @@ export class ClipboardBoard extends DurableObject {
     if (!body || typeof body !== "object") return json({ error: "File metadata is required." }, 400);
     const metadata = this.validateFile(body.name, body.size, body.type);
     if (metadata instanceof Response) return metadata;
+    const mode = body.mode || "multipart";
+    if (!["multipart", "rclone"].includes(mode)) return json({ error: "Invalid upload mode." }, 400);
+    if (mode === "rclone" && !rcloneConfig(this.env).configured) return json({ error: "Rclone uploads are not configured. Run patrick wb --setup first." }, 503);
+    if (mode === "rclone" && (typeof body.stopToken !== "string" || !/^[a-f0-9]{64}$/.test(body.stopToken))) return json({ error: "A private upload stop token is required." }, 400);
+    const tokenHash = mode === "rclone" ? await stopTokenHash(body.stopToken) : undefined;
     const id = body.id || crypto.randomUUID();
     if (typeof id !== "string" || !new RegExp(`^${UUID}$`).test(id)) return json({ error: "Invalid upload ID." }, 400);
     const existing = await this.ctx.storage.get(`file:${id}`);
     if (existing) {
-      if (existing.name !== metadata.name || existing.size !== metadata.size || existing.type !== metadata.type) return json({ error: "This upload ID is already in use." }, 409);
+      if (existing.name !== metadata.name || existing.size !== metadata.size || existing.type !== metadata.type || (existing.mode || "multipart") !== mode || (mode === "rclone" && existing.status !== "ready" && existing.stopTokenHash !== tokenHash)) return json({ error: "This upload ID is already in use." }, 409);
       if (!["uploading", "ready"].includes(existing.status) || existing.expiresAt <= Date.now()) return json({ error: "Upload is unavailable. Start a new upload." }, 409);
       return json(this.session(existing));
     }
-    const file = await this.reserveFile(metadata, id);
+    const file = await this.reserveFile(mode === "rclone" ? { ...metadata, mode, stopTokenHash: tokenHash, leaseUntil: Date.now() + UPLOAD_TTL } : metadata, id);
     if (file instanceof Response) return file;
+    if (mode === "rclone") {
+      file.status = "uploading";
+      await this.ctx.storage.put(`file:${id}`, file);
+      return json(this.session(file), 201);
+    }
     try {
       const upload = await this.env.ATTACHMENTS.createMultipartUpload(file.key, { httpMetadata: { contentType: file.type } });
       file.uploadId = upload.uploadId;
@@ -264,7 +280,7 @@ export class ClipboardBoard extends DurableObject {
 
   async uploadPart(id, partNumber, request) {
     const file = await this.ctx.storage.get(`file:${id}`);
-    if (!file || file.status !== "uploading" || file.expiresAt <= Date.now()) return json({ error: "Upload is unavailable or expired." }, 409);
+    if (!file || file.mode === "rclone" || file.status !== "uploading" || file.expiresAt <= Date.now()) return json({ error: "Upload is unavailable or expired." }, 409);
     const count = Math.ceil(file.size / PART_SIZE);
     if (!Number.isSafeInteger(partNumber) || partNumber < 1 || partNumber > count) return json({ error: "Invalid part number." }, 400);
     const size = Math.min(PART_SIZE, file.size - (partNumber - 1) * PART_SIZE);
@@ -276,10 +292,25 @@ export class ClipboardBoard extends DurableObject {
     return json({ partNumber: part.partNumber, etag: part.etag, size });
   }
 
-  async completeUpload(id) {
+  async completeUpload(id, request) {
     const file = await this.ctx.storage.get(`file:${id}`);
     if (!file || file.status === "deleting" || file.expiresAt <= Date.now()) return json({ error: "Upload is unavailable or expired." }, 409);
     if (file.status === "ready") return json(publicFile(file));
+    if (file.mode === "rclone") {
+      if (!await this.validStopToken(file, request)) return json({ error: "Invalid upload stop token." }, 403);
+      // Only the uploader can acknowledge that rclone has exited. Until then,
+      // cancellation retains quota and keeps sweeping the key for late writes.
+      file.rcloneStopped = true;
+      file.status = "completing";
+      await this.ctx.storage.put(`file:${id}`, file);
+      const object = await this.env.ATTACHMENTS.head(file.key);
+      if (!object) return json({ error: "Rclone has not uploaded this file yet." }, 409);
+      if (object.size !== file.size || object.uploaded.getTime() < file.createdAt - 1000) return json({ error: "Uploaded object does not match its reservation." }, 409);
+      if (!await abortRcloneParts(this.env, file.key)) return json({ error: "Multipart cleanup is still in progress. Please retry." }, 503);
+      delete file.leaseUntil;
+      delete file.stopTokenHash;
+      return this.finishFile(file, object);
+    }
     // A lost completion response or process restart must not strand a complete
     // R2 object. R2's object timestamp keeps retries from extending retention.
     if (file.status === "completing") {
@@ -297,9 +328,20 @@ export class ClipboardBoard extends DurableObject {
     return this.finishFile(file, object);
   }
 
-  async abortUpload(id) {
+  async validStopToken(file, request) {
+    if (!request?.body) return false;
+    let body;
+    try { body = await request.json(); } catch { return false; }
+    return typeof body?.stopToken === "string" && /^[a-f0-9]{64}$/.test(body.stopToken) && await stopTokenHash(body.stopToken) === file.stopTokenHash;
+  }
+
+  async abortUpload(id, request) {
     const file = await this.ctx.storage.get(`file:${id}`);
     if (file?.status === "ready") return json({ error: "This upload is already complete. Delete the shared file instead." }, 409);
+    if (file?.mode === "rclone" && request) {
+      if (!await this.validStopToken(file, request)) return json({ error: "Invalid upload stop token." }, 403);
+      file.rcloneStopped = true;
+    }
     const deleted = !file || await this.deleteFile(file);
     await this.schedule();
     return json({ cancelled: true, cleanupPending: !deleted });
@@ -339,6 +381,11 @@ export class ClipboardBoard extends DurableObject {
     await this.ctx.storage.put(`file:${file.id}`, file);
     await this.schedule();
     try {
+      let keepReservation = false;
+      if (file.mode === "rclone" && file.leaseUntil) {
+        if (!await abortRcloneParts(this.env, file.key)) return false;
+        keepReservation = !file.rcloneStopped && file.leaseUntil > Date.now();
+      }
       if (file.uploadId) {
         try {
           await this.env.ATTACHMENTS.resumeMultipartUpload(file.key, file.uploadId).abort();
@@ -348,6 +395,7 @@ export class ClipboardBoard extends DurableObject {
         }
       }
       await this.env.ATTACHMENTS.delete(file.key);
+      if (keepReservation) return false;
       await this.ctx.storage.delete(`file:${file.id}`);
       return true;
     } catch (error) {

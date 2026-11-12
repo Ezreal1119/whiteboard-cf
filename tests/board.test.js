@@ -1,16 +1,28 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { build } from "esbuild";
+import { fileURLToPath } from "node:url";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
 import { uploadFile as uploadClient } from "../public/uploads.js";
 import { createHash } from "node:crypto";
 
 let mf, stub, bucket;
+let s3Failure = false;
+const s3Uploads = new Map();
 before(async () => {
-  const source = await readFile(new URL("../src/worker.js", import.meta.url), "utf8");
+  const bundle = await build({ entryPoints: [fileURLToPath(new URL("../src/worker.js", import.meta.url))], bundle: true, write: false, format: "esm", platform: "browser", target: "es2022", external: ["cloudflare:workers"] });
+  const source = bundle.outputFiles[0].text;
   // Test-only RPC controls; none are included in the deployed Worker.
   const harness = `
 export class TestBoard extends ClipboardBoard {
+  async testConfig(enabled) { this.env.R2_ACCESS_KEY_ID = enabled ? 'test-access' : ''; }
+  async testLeaseExpired(id) {
+    const file = await this.ctx.storage.get('file:' + id);
+    file.leaseUntil = Date.now() - 1;
+    file.expiresAt = Date.now() - 1;
+    delete file.retryAt;
+    await this.ctx.storage.put('file:' + id, file);
+  }
   async testExpire(kind) {
     if (kind === 'text') {
       const record = await this.ctx.storage.get('content');
@@ -64,7 +76,14 @@ export class TestBoard extends ClipboardBoard {
     modules: true, script: faultInjected + harness,
     compatibilityDate: "2026-10-08", compatibilityFlags: ["nodejs_compat"],
     durableObjects: { BOARD: { className: "TestBoard", useSQLite: true } },
-    r2Buckets: ["ATTACHMENTS"], bindings: { BOARD_TTL_SECONDS: "86400" },
+    r2Buckets: ["ATTACHMENTS"], bindings: { BOARD_TTL_SECONDS: "86400", R2_S3_ENDPOINT: "https://test.r2.cloudflarestorage.com", R2_BUCKET_NAME: "whiteboard-attachments", R2_ACCESS_KEY_ID: "test-access", R2_SECRET_ACCESS_KEY: "test-secret" },
+    outboundService: async request => {
+      if (s3Failure) return new Response('Unavailable', {status:503});
+      assert.match(request.headers.get('Authorization'), /^AWS4-HMAC-SHA256 /);
+      const key = new URL(request.url).searchParams.get('prefix');
+      const uploads = (s3Uploads.get(key) || []).map(id => `<Upload><Key>${key}</Key><UploadId>${id}</UploadId></Upload>`).join('');
+      return new Response(`<ListMultipartUploadsResult><Bucket>whiteboard-attachments</Bucket><IsTruncated>false</IsTruncated>${uploads}</ListMultipartUploadsResult>`, {headers:{'Content-Type':'application/xml'}});
+    },
   }));
   const ns = await mf.getDurableObjectNamespace("BOARD");
   stub = ns.get(ns.idFromName("personal-whiteboard"));
@@ -81,7 +100,10 @@ async function upload(name = "测试截图.png", body = "image bytes", type = "i
   return request("/api/files", { method: "POST", headers: { "X-File-Name": encodeURIComponent(name), "Content-Type": type }, body });
 }
 async function reset() {
+  s3Failure = false;
   await stub.testFailure(false);
+  // External test clients have exited before teardown.
+  for (const file of await stub.testFiles()) if (file.mode === 'rclone') await stub.testLeaseExpired(file.id);
   await request("/api/board", { method: "DELETE" });
   await stub.testCleanup();
 }
@@ -358,4 +380,89 @@ test("a file larger than 100 MB uploads and streams back with matching SHA-256",
   for await (const chunk of download.body) actual.update(chunk);
   assert.equal(actual.digest('hex'), expected.digest('hex'));
   await reset();
+});
+
+const STOP_TOKEN = '1'.repeat(64);
+async function createRclone(size = 3) {
+  return request('/api/uploads', {method:'POST',body:JSON.stringify({name:'rclone.bin',size,mode:'rclone',stopToken:STOP_TOKEN})});
+}
+function stoppedRequest(id, action, token = STOP_TOKEN) {
+  return request(`/api/uploads/${id}/${action}`, {method:'POST', body:JSON.stringify({stopToken:token})});
+}
+
+test('rclone creation requires server credentials and returns no secrets or native multipart session', async () => {
+  await reset();
+  await stub.testConfig(false);
+  assert.equal((await createRclone()).status,503);
+  await stub.testConfig(true);
+  const response=await createRclone(); assert.equal(response.status,201);
+  const session=await response.json();
+  assert.equal(session.mode,'rclone');
+  assert.equal(session.bucket,'whiteboard-attachments');
+  assert.equal(session.key,'attachments/'+session.id);
+  const stored=(await stub.testFiles())[0];
+  assert.equal(stored.uploadId,undefined);
+  assert.equal(stored.stopToken,undefined);
+  assert.equal(typeof stored.stopTokenHash,'string');
+  const publicStatus=await(await request('/api/uploads/'+session.id)).json();
+  assert.equal(publicStatus.stopTokenHash,undefined);
+  assert.equal(publicStatus.stopToken,undefined);
+  assert.equal((await part(session.id,1,'abc')).status,409);
+  await reset();
+});
+
+test('rclone registers a directly uploaded object with three-day sharing and idempotent completion', async () => {
+  await reset();
+  const session=await(await createRclone()).json();
+  assert.equal((await stoppedRequest(session.id,'complete','2'.repeat(64))).status,403);
+  assert.equal((await stoppedRequest(session.id,'complete')).status,409);
+  await bucket.put(session.key,'abc');
+  const response=await stoppedRequest(session.id,'complete');assert.equal(response.status,201);
+  const file=await response.json();assert.equal(file.size,3);
+  assert.equal(file.expiresAt-file.uploadedAt,259200000);
+  assert.equal((await boardState()).files.length,1);
+  assert.equal(await(await request('/api/files/'+file.id)).text(),'abc');
+  assert.equal((await stoppedRequest(session.id,'complete')).status,200);
+  await reset();
+});
+
+test('rclone rejects mismatched objects and cleans them up on acknowledged cancellation', async () => {
+  await reset();
+  const session=await(await createRclone()).json();
+  await bucket.put(session.key,'too large');
+  assert.equal((await stoppedRequest(session.id,'complete')).status,409);
+  assert.equal((await boardState()).files.length,0);
+  assert.equal((await stoppedRequest(session.id,'cancel')).status,200);
+  assert.equal(await bucket.head(session.key),null);
+  assert.equal((await boardState()).storage.usedBytes,0);
+});
+
+test('board-side cancellation retains quota until the rclone client acknowledges it stopped', async () => {
+  await reset();
+  const session=await(await createRclone()).json();
+  const unfinished=await bucket.createMultipartUpload(session.key);
+  await unfinished.uploadPart(1,'abc');
+  s3Uploads.set(session.key,[unfinished.uploadId]);
+  const cancelled=await(await request('/api/uploads/'+session.id,{method:'DELETE'})).json();
+  assert.equal(cancelled.cleanupPending,true);
+  assert.equal((await boardState()).storage.usedBytes,3);
+  assert.equal((await request('/api/uploads/'+session.id)).status,404);
+  await assert.rejects(()=>unfinished.uploadPart(1,'abc'));
+  assert.equal((await stoppedRequest(session.id,'cancel','2'.repeat(64))).status,403);
+  const stopped=await(await stoppedRequest(session.id,'cancel')).json();
+  assert.equal(stopped.cleanupPending,false);
+  assert.equal((await boardState()).storage.usedBytes,0);
+});
+
+test('expired rclone sessions and failed S3 cleanup recover without leaking reserved space', async () => {
+  await reset();
+  const session=await(await createRclone()).json();
+  s3Failure=true;
+  const cancelled=await(await stoppedRequest(session.id,'cancel')).json();
+  assert.equal(cancelled.cleanupPending,true);
+  assert.equal((await boardState()).storage.usedBytes,3);
+  s3Failure=false;
+  await stub.testLeaseExpired(session.id);
+  await stub.testCleanup();
+  assert.equal((await boardState()).storage.usedBytes,0);
 });

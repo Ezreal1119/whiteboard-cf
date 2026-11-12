@@ -3,7 +3,9 @@
   "name": "ten-minute-whiteboard",
   "main": "src/worker.js",
   "compatibility_date": "2026-10-08",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
   "routes": [
     {
       "pattern": "whiteboard.patrick-shenzhen.org",
@@ -27,7 +29,9 @@
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["ClipboardBoard"]
+      "new_sqlite_classes": [
+        "ClipboardBoard"
+      ]
     }
   ],
   "r2_buckets": [
@@ -37,6 +41,8 @@
     }
   ],
   "vars": {
-    "BOARD_TTL_SECONDS": "86400"
+    "BOARD_TTL_SECONDS": "86400",
+    "R2_S3_ENDPOINT": "https://570ff3ceb3e6abe16b9c7e2c59b7ed2d.r2.cloudflarestorage.com",
+    "R2_BUCKET_NAME": "whiteboard-attachments"
   }
 }

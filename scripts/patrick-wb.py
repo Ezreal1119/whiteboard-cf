@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Patrick whiteboard client: text, shared-file lists, and bounded multipart uploads."""
+"""Patrick whiteboard client: text, shared-file lists, and direct rclone uploads."""
 import json
+import configparser
+import getpass
+import os
+import shutil
+import tempfile
 import mimetypes
 from pathlib import Path
 import signal
@@ -12,10 +17,14 @@ import uuid
 
 BASE_URL = "https://whiteboard.patrick-shenzhen.org"
 MAX_FILE_SIZE = 3_000_000_000
+RCLONE_CONFIG = Path.home() / ".config" / "patrick-wb" / "rclone.conf"
+PROJECT_DIR = Path(os.environ.get("PATRICK_WB_PROJECT", Path.home() / "whiteboard-cf"))
 
 
 class APIError(RuntimeError):
-    pass
+    def __init__(self, message, status=0):
+        super().__init__(message)
+        self.status = status
 
 
 def request(method, path, *, metadata=None, data=None, attempts=3, timeout=600):
@@ -51,7 +60,7 @@ def request(method, path, *, metadata=None, data=None, attempts=3, timeout=600):
         message = response.get("error") if isinstance(response, dict) else None
         message = message or result.stderr.decode("utf-8", errors="replace").strip() or "Unexpected server response."
         if (status not in (0, 429) and status < 500) or attempt + 1 == attempts:
-            raise APIError(message)
+            raise APIError(message, status)
         time.sleep(0.5 * 2 ** attempt)
     raise APIError("Request failed.")
 
@@ -79,9 +88,24 @@ def show_board():
         print(f"\nStorage: {format_size(board['storage']['usedBytes'])} / {format_size(board['limits']['totalBytes'])} (including uploads)")
 
 
+def stop_rclone(process):
+    if process.poll() is not None:
+        return
+    for sig, timeout in [(signal.SIGINT, 20), (signal.SIGTERM, 5), (signal.SIGKILL, 5)]:
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=timeout)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+    raise APIError("Could not stop rclone; server-side cleanup will retain the reservation.")
+
+
 def upload_file(path):
     file = Path(path).expanduser().resolve()
-    # Pasting a path from rich text can accidentally append a non-breaking space.
     if not file.exists() and path.rstrip() != path:
         candidate = Path(path.rstrip()).expanduser().resolve()
         if candidate.is_file():
@@ -92,38 +116,57 @@ def upload_file(path):
     initial = file.stat()
     if not 0 < initial.st_size <= MAX_FILE_SIZE:
         raise APIError("File must be between 1 byte and 3 GB.")
+    if not shutil.which("rclone") or not RCLONE_CONFIG.is_file():
+        raise APIError("Direct uploads are not configured. Run patrick wb --setup first.")
     upload_id = str(uuid.uuid4())
+    token = uuid.uuid4().hex + uuid.uuid4().hex
     upload_path = "/api/uploads/" + upload_id
+    process = None
+    stopped = True
     try:
         session = request("POST", "/api/uploads", metadata={
-            "id": upload_id, "name": file.name, "size": initial.st_size,
+            "id": upload_id, "mode": "rclone", "stopToken": token,
+            "name": file.name, "size": initial.st_size,
             "type": mimetypes.guess_type(file.name)[0] or "application/octet-stream",
         })
         if session.get("status") == "ready":
             return session["file"]
-        part_size, part_count = session["partSize"], session["partCount"]
-        if not isinstance(part_size, int) or not 0 < part_size <= 32 * 1024 * 1024:
-            raise APIError("Unexpected upload part size.")
-        if part_count != (initial.st_size + part_size - 1) // part_size:
-            raise APIError("Unexpected upload part count.")
-        uploaded = 0
-        with file.open("rb") as source:
-            for number in range(1, part_count + 1):
-                expected = min(part_size, initial.st_size - uploaded)
-                chunk = source.read(expected)
-                if len(chunk) != expected:
-                    raise APIError("The file changed during upload. Please retry.")
-                print(f"Uploading {file.name}: part {number}/{part_count} ({uploaded / initial.st_size:.0%})", file=sys.stderr, flush=True)
-                request("PUT", f"{upload_path}/parts/{number}", data=chunk)
-                uploaded += len(chunk)
-                del chunk
+        if session.get("key") != "attachments/" + upload_id or session.get("bucket") != "whiteboard-attachments":
+            raise APIError("Unexpected R2 upload destination.")
+        command = ["rclone", "--config", str(RCLONE_CONFIG), "copyto", str(file),
+                   "wb:" + session["bucket"] + "/" + session["key"],
+                   "--s3-no-check-bucket", "--s3-upload-cutoff", "0",
+                   "--s3-chunk-size", "16Mi", "--s3-upload-concurrency", "4",
+                   "--max-duration", "22h", "-P"]
+        # A separate process group lets us stop every transfer before acknowledging
+        # cancellation. Native multipart uploads can then be aborted atomically.
+        process = subprocess.Popen(command, start_new_session=True)
+        stopped = False
+        while True:
+            try:
+                code = process.wait(timeout=5)
+                stopped = True
+                break
+            except subprocess.TimeoutExpired:
+                try:
+                    request("GET", upload_path, attempts=1, timeout=10)
+                except APIError as error:
+                    if error.status in (404, 409):
+                        raise APIError("Upload was cancelled on the board.") from error
+        if code:
+            raise APIError(f"Rclone upload failed (exit code {code}).")
         current = file.stat()
         if current.st_size != initial.st_size or current.st_mtime_ns != initial.st_mtime_ns:
             raise APIError("The file changed during upload. Please retry.")
-        print("Upload complete. Finalizing shared file...", file=sys.stderr, flush=True)
-        return request("POST", upload_path + "/complete")
+        print("Upload complete. Registering shared file...", file=sys.stderr, flush=True)
+        return request("POST", upload_path + "/complete", metadata={"stopToken": token})
     except BaseException:
-        # Completion may have succeeded even if the response was lost.
+        if process is not None:
+            try:
+                stop_rclone(process)
+                stopped = process.poll() is not None
+            except (APIError, KeyboardInterrupt):
+                stopped = False
         try:
             status = request("GET", upload_path, attempts=1, timeout=15)
             if status.get("status") == "ready":
@@ -131,14 +174,79 @@ def upload_file(path):
         except (APIError, KeyboardInterrupt):
             pass
         try:
-            request("DELETE", upload_path, attempts=2, timeout=15)
+            if stopped:
+                result = request("POST", upload_path + "/cancel", metadata={"stopToken": token}, attempts=2, timeout=30)
+            else:
+                result = request("DELETE", upload_path, attempts=2, timeout=15)
+            if result.get("cleanupPending"):
+                print("Cleanup is pending; the server will retry before releasing reserved capacity.", file=sys.stderr)
         except (APIError, KeyboardInterrupt):
             print("Cleanup will retry automatically on the server.", file=sys.stderr)
         raise
 
 
+def setup_rclone():
+    if not shutil.which("rclone"):
+        raise APIError("Install rclone first: brew install rclone")
+    config_path = PROJECT_DIR / "wrangler.jsonc"
+    if not config_path.is_file():
+        raise APIError("Cannot find the project. Set PATRICK_WB_PROJECT to the whiteboard-cf directory.")
+    config = request("GET", "/api/uploads/config", timeout=30)["rclone"]
+    endpoint, bucket = config["endpoint"], config["bucket"]
+    from urllib.parse import urlsplit
+    host = urlsplit(endpoint).hostname or ""
+    if not endpoint.startswith("https://") or not host.endswith(".r2.cloudflarestorage.com") or bucket != "whiteboard-attachments":
+        raise APIError("Unexpected R2 configuration returned by the server.")
+    print("Use an R2 Object Read & Write key scoped to whiteboard-attachments.")
+    print("The key will be stored in a private local rclone file and Cloudflare Worker Secrets for background cleanup.")
+    access_key = getpass.getpass("R2 Access Key ID (hidden): ").strip()
+    secret_key = getpass.getpass("R2 Secret Access Key (hidden): ").strip()
+    if any(not value or len(value) > 512 or not value.isascii() or any(char.isspace() for char in value) for value in (access_key, secret_key)):
+        raise APIError("Invalid R2 credentials.")
+    parser = configparser.ConfigParser(interpolation=None)
+    parser["wb"] = {"type": "s3", "provider": "Cloudflare", "access_key_id": access_key,
+                    "secret_access_key": secret_key, "endpoint": endpoint, "region": "auto"}
+    RCLONE_CONFIG.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    RCLONE_CONFIG.parent.chmod(0o700)
+    pending = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=RCLONE_CONFIG.parent, prefix=".setup-", delete=False) as stream:
+            pending = Path(stream.name)
+            parser.write(stream)
+        pending.chmod(0o600)
+        check = subprocess.run(["rclone", "--config", str(pending), "lsf", "wb:" + bucket,
+                                "--dirs-only", "--max-depth", "1", "--s3-no-check-bucket",
+                                "--contimeout", "10s", "--timeout", "20s", "--retries", "1", "--low-level-retries", "1"],
+                               capture_output=True, timeout=45)
+        if check.returncode:
+            raise APIError("R2 access check failed. Verify the credentials and bucket permissions, then rerun --setup.")
+        secrets = json.dumps({"R2_ACCESS_KEY_ID": access_key, "R2_SECRET_ACCESS_KEY": secret_key}).encode()
+        result = subprocess.run(["npx", "--no-install", "wrangler", "secret", "bulk", "--config", str(config_path)],
+                                input=secrets, cwd=PROJECT_DIR, capture_output=True, timeout=60)
+        if result.returncode:
+            raise APIError("Worker secret setup failed. Check Wrangler login in the project directory, then rerun --setup.")
+        active = False
+        for attempt in range(5):
+            try:
+                active = request("GET", "/api/uploads/config", attempts=1, timeout=10)["rclone"].get("configured", False)
+            except APIError:
+                active = False
+            if active:
+                break
+            time.sleep(1)
+        if not active:
+            raise APIError("Worker credentials are not active yet. Rerun --setup after the deployment finishes.")
+        pending.replace(RCLONE_CONFIG)
+        print("Rclone direct uploads configured. Run: patrick wb -f <file_path>")
+    finally:
+        if pending is not None:
+            pending.unlink(missing_ok=True)
+
+
 def main(args):
-    if args == ["--get"]:
+    if args == ["--setup"]:
+        setup_rclone()
+    elif args == ["--get"]:
         show_board()
     elif len(args) == 2 and args[0] == "-f":
         file = upload_file(args[1])
@@ -149,7 +257,7 @@ def main(args):
         print("Text uploaded. Expires in 24 hours.")
         print(BASE_URL + "/")
     else:
-        raise APIError('Usage: patrick wb "text..." | patrick wb -f <path> | patrick wb --get')
+        raise APIError('Usage: patrick wb "text..." | patrick wb -f <path> | patrick wb --get | patrick wb --setup')
 
 
 if __name__ == "__main__":

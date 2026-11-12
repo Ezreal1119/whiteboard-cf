@@ -5,12 +5,17 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "check": "node --check src/worker.js && node --check public/app.js && node --check public/uploads.js",
+    "check": "node --check src/worker.js && node --check src/rclone-storage.js && node --check public/app.js && node --check public/uploads.js",
     "deploy": "wrangler deploy",
     "test": "node --test tests/*.test.js && python3 -m unittest discover -s tests -p 'test_*.py'"
   },
   "devDependencies": {
+    "esbuild": "^0.28.1",
     "miniflare": "5.20261006.0-alpha",
     "wrangler": "^4.92.0"
+  },
+  "dependencies": {
+    "aws4fetch": "^1.0.20",
+    "fast-xml-parser": "^5.12.0"
   }
 }

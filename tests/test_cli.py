@@ -4,9 +4,10 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import subprocess
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 spec = importlib.util.spec_from_file_location("patrick_wb", Path(__file__).parents[1] / "scripts" / "patrick-wb.py")
 cli = importlib.util.module_from_spec(spec)
@@ -19,6 +20,19 @@ def reply(data, status=200):
 
 
 class CLITests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.config = self.root / "rclone.conf"
+        self.config.write_text("[wb]\ntype = s3\n")
+        config_patch = patch.object(cli, "RCLONE_CONFIG", self.config)
+        config_patch.start()
+        self.addCleanup(config_patch.stop)
+        binary_patch = patch.object(cli.shutil, "which", return_value="/usr/bin/rclone")
+        binary_patch.start()
+        self.addCleanup(binary_patch.stop)
+
     def test_text_json_escaping(self):
         text = 'Text "quoted"\nUnicode: 中文'
         with patch.object(cli.subprocess, "run", return_value=reply({})) as run:
@@ -41,57 +55,94 @@ class CLITests(unittest.TestCase):
                 cli.request("POST", "/api/uploads", metadata={})
         self.assertEqual(run.call_count, 1)
 
-    def test_file_chunks_retry_and_complete(self):
-        with tempfile.TemporaryDirectory() as root:
-            file = Path(root) / "image.png"
-            file.write_bytes(b"abcde")
-            chunks, attempts = [], []
+    def test_rclone_direct_upload_and_registration(self):
+        file = self.root / "image.png"
+        file.write_bytes(b"abcde")
+        created = {}
+        def run(command, **kwargs):
+            method = command[command.index("-X") + 1]
+            url = command[command.index("-X") + 2]
+            self.assertNotEqual(method, "PUT", "File data must never pass through curl/Worker")
+            body = json.loads(kwargs.get("input") or b"{}")
+            if url.endswith("/api/uploads"):
+                created.update(body)
+                self.assertEqual(body["mode"], "rclone")
+                return reply({"key": "attachments/" + body["id"], "bucket": "whiteboard-attachments"})
+            if url.endswith("/complete"):
+                self.assertEqual(body["stopToken"], created["stopToken"])
+                return reply({"id": created["id"], "name": file.name})
+            self.fail("Unexpected request")
+        process = MagicMock()
+        process.wait.return_value = 0
+        with patch.object(cli.subprocess, "run", side_effect=run), patch.object(cli.subprocess, "Popen", return_value=process) as launch, contextlib.redirect_stderr(io.StringIO()):
+            result = cli.upload_file(str(file))
+        command = launch.call_args.args[0]
+        self.assertEqual(command[0], "rclone")
+        self.assertIn("wb:whiteboard-attachments/attachments/" + created["id"], command)
+        self.assertEqual(command[command.index("--s3-upload-cutoff") + 1], "0")
+        self.assertTrue(launch.call_args.kwargs["start_new_session"])
+        self.assertEqual(result["id"], created["id"])
 
-            def run(command, **kwargs):
-                method = command[command.index("-X") + 1]
-                url = command[command.index("-X") + 2]
-                if method == "POST" and url.endswith("/api/uploads"):
-                    metadata = json.loads(kwargs["input"])
-                    self.assertEqual(metadata["size"], 5)
-                    self.assertEqual(metadata["type"], "image/png")
-                    return reply({"partSize": 2, "partCount": 3})
-                if method == "PUT":
-                    attempts.append(kwargs["input"])
-                    if len(attempts) == 1:
-                        return reply({"error": "Transient failure"}, 503)
-                    chunks.append(kwargs["input"])
-                    return reply({})
-                if url.endswith("/complete"):
-                    return reply({"id": "file-id", "name": file.name})
-                self.fail(f"Unexpected request: {method} {url}")
+    def test_interruption_stops_rclone_before_acknowledging_cancellation(self):
+        file = self.root / "cancel.bin"
+        file.write_bytes(b"abc")
+        events, created = [], {}
+        def run(command, **kwargs):
+            method = command[command.index("-X") + 1]
+            url = command[command.index("-X") + 2]
+            body = json.loads(kwargs.get("input") or b"{}")
+            if url.endswith("/api/uploads"):
+                created.update(body)
+                return reply({"key":"attachments/"+body["id"],"bucket":"whiteboard-attachments"})
+            if method == "GET": return reply({"status":"uploading"})
+            if url.endswith("/cancel"):
+                events.append("acknowledge")
+                self.assertEqual(events[0], "stop")
+                self.assertEqual(body["stopToken"], created["stopToken"])
+                return reply({"cancelled":True})
+            self.fail("Unexpected request")
+        process = MagicMock()
+        process.wait.side_effect = KeyboardInterrupt()
+        process.poll.return_value = None
+        def stop(_process):
+            events.append("stop")
+            process.poll.return_value = 0
+        with patch.object(cli.subprocess,"run",side_effect=run), patch.object(cli.subprocess,"Popen",return_value=process), patch.object(cli,"stop_rclone",side_effect=stop):
+            with self.assertRaises(KeyboardInterrupt): cli.upload_file(str(file))
+        self.assertEqual(events, ["stop", "acknowledge"])
 
-            with patch.object(cli.subprocess, "run", side_effect=run), patch.object(cli.time, "sleep"), contextlib.redirect_stderr(io.StringIO()):
-                result = cli.upload_file(str(file))
-            self.assertEqual(chunks, [b"ab", b"cd", b"e"])
-            self.assertEqual(attempts[:2], [b"ab", b"ab"])
-            self.assertEqual(result["id"], "file-id")
+    def test_remote_cancellation_stops_active_rclone(self):
+        file = self.root / "cancel.bin"
+        file.write_bytes(b"abc")
+        def run(command, **kwargs):
+            method = command[command.index("-X") + 1]
+            url = command[command.index("-X") + 2]
+            if url.endswith("/api/uploads"):
+                body=json.loads(kwargs["input"])
+                return reply({"key":"attachments/"+body["id"],"bucket":"whiteboard-attachments"})
+            if method == "GET": return reply({"error":"Upload not found"},404)
+            return reply({"cancelled":True})
+        process=MagicMock()
+        process.wait.side_effect=subprocess.TimeoutExpired("rclone",5)
+        process.poll.return_value=None
+        def stop(_process): process.poll.return_value=0
+        with patch.object(cli.subprocess,"run",side_effect=run), patch.object(cli.subprocess,"Popen",return_value=process), patch.object(cli,"stop_rclone",side_effect=stop) as stop_call:
+            with self.assertRaisesRegex(cli.APIError,"cancelled on the board"): cli.upload_file(str(file))
+        stop_call.assert_called_once()
 
-    def test_interruption_cancels_reservation(self):
-        with tempfile.TemporaryDirectory() as root:
-            file = Path(root) / "cancel.bin"
-            file.write_bytes(b"abc")
-            methods = []
-
-            def run(command, **kwargs):
-                method = command[command.index("-X") + 1]
-                methods.append(method)
-                if method == "POST":
-                    return reply({"partSize": 3, "partCount": 1})
-                if method == "PUT":
-                    raise KeyboardInterrupt()
-                if method == "GET":
-                    return reply({"status": "uploading"})
-                return reply({"cancelled": True})
-
-            with patch.object(cli.subprocess, "run", side_effect=run), contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaises(KeyboardInterrupt):
-                    cli.upload_file(str(file))
-            self.assertEqual(methods, ["POST", "PUT", "GET", "DELETE"])
+    def test_setup_keeps_credentials_out_of_arguments_and_private_on_disk(self):
+        project=self.root/'project';project.mkdir();(project/'wrangler.jsonc').write_text('{}')
+        config={'rclone':{'configured':True,'endpoint':'https://test.r2.cloudflarestorage.com','bucket':'whiteboard-attachments'}}
+        with patch.object(cli,'PROJECT_DIR',project), patch.object(cli,'request',return_value=config), patch.object(cli.getpass,'getpass',side_effect=['test-access-key','test-secret-key']), patch.object(cli.subprocess,'run',return_value=SimpleNamespace(returncode=0)) as run, contextlib.redirect_stdout(io.StringIO()) as output:
+            cli.setup_rclone()
+        self.assertNotIn('test-secret-key',output.getvalue())
+        self.assertIn('secret_access_key = test-secret-key',self.config.read_text())
+        self.assertEqual(self.config.stat().st_mode & 0o777,0o600)
+        for call in run.call_args_list:
+            self.assertNotIn('test-secret-key',' '.join(call.args[0]))
+        secrets=json.loads(run.call_args_list[1].kwargs['input'])
+        self.assertEqual(secrets['R2_SECRET_ACCESS_KEY'],'test-secret-key')
+        self.assertFalse(list(self.root.glob('.setup-*')))
 
     def test_files_above_3_gb_rejected_before_network(self):
         with tempfile.TemporaryDirectory() as root:
