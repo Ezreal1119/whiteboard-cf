@@ -60,6 +60,9 @@ copyButton.addEventListener("click", async () => {
 });
 clearButton.addEventListener("click", async () => {
   if (clearing || uploading) return;
+  if ((files.length || storageUsage?.reservedBytes) && !window.confirm(
+    "Clear all text, files, and images, including uploads in progress? This cannot be undone."
+  )) return;
   clearing = true;
   epoch++;
   clearTimeout(saveTimer);
